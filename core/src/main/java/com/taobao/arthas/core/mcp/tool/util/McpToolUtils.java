@@ -122,8 +122,8 @@ public final class McpToolUtils {
 	}
 
 	private static String convertParametersToString(Map<String, Object> parameters) {
-		if (parameters == null) {
-			return "";
+		if (parameters == null || parameters.isEmpty()) {
+			return "{}";
 		}
 		try {
 			return new ObjectMapper().writeValueAsString(parameters);
