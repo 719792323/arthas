@@ -59,6 +59,14 @@ public class DefaultToolCallbackProvider implements ToolCallbackProvider {
 
     private ToolCallback[] scanForToolCallbacks() {
         List<ToolCallback> callbacks = new ArrayList<>();
+        
+        // 如果没有配置扫描包，返回空数组
+        if (toolBasePackage == null || toolBasePackage.isEmpty()) {
+            logger.warn("No toolBasePackage configured, returning empty tool list. " +
+                    "Call setToolBasePackage() to configure the package to scan.");
+            return callbacks.toArray(new ToolCallback[0]);
+        }
+        
         try {
             logger.info("Starting to scan for tool callbacks in package: {}", toolBasePackage);
             scanPackageForToolMethods(toolBasePackage, callbacks);
