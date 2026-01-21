@@ -77,6 +77,14 @@ STREAMABLE_TIMEOUT = 60.0
 # 普通命令的默认超时时间（秒）
 DEFAULT_TIMEOUT = 30.0
 
+# 调试模式开关（设置为 True 显示详细日志）
+DEBUG = os.getenv('MCP_DEBUG', '').lower() in ('1', 'true', 'yes')
+
+def debug_print(*args, **kwargs):
+    """仅在调试模式下打印"""
+    if DEBUG:
+        print(*args, **kwargs)
+
 
 # 全局状态
 class ServerState:
@@ -106,6 +114,10 @@ class ServerState:
             return self.request_id_counter
 
 
+# 响应回调函数类型
+ResponseCallback = Any  # Callable[[Dict], None]
+
+
 class ClientSession:
     """客户端会话"""
 
@@ -113,8 +125,10 @@ class ClientSession:
         self.session_id = session_id
         self.created_at = time.time()
         self.sse_queue: queue.Queue = queue.Queue()
-        self.pending_requests: Dict[int, threading.Event] = {}
-        self.pending_responses: Dict[int, Any] = {}
+        # 异步模式：存储回调函数而不是 Event
+        self.pending_callbacks: Dict[int, ResponseCallback] = {}
+        # 存储请求的元信息（用于打印）
+        self.pending_request_info: Dict[int, Dict] = {}
         self.tools: List[Dict] = []
         self.initialized = False
         self.client_info: Dict = {}
@@ -122,32 +136,37 @@ class ClientSession:
 
     def close(self):
         self.active = False
-        # 唤醒所有等待的请求
-        for event in self.pending_requests.values():
-            event.set()
+        # 通知所有等待的回调请求已取消
+        for request_id, callback in list(self.pending_callbacks.items()):
+            try:
+                callback({'error': {'message': 'Session closed'}})
+            except:
+                pass
+        self.pending_callbacks.clear()
+        self.pending_request_info.clear()
 
     def send_sse_event(self, event_type: str, data: Any):
         """发送 SSE 事件"""
         if self.active:
             self.sse_queue.put((event_type, data))
 
-    def wait_response(self, request_id: int, timeout: float = 30.0) -> Optional[Any]:
-        """等待响应"""
-        event = threading.Event()
-        self.pending_requests[request_id] = event
+    def register_callback(self, request_id: int, callback: ResponseCallback, info: Dict = None):
+        """注册异步回调"""
+        self.pending_callbacks[request_id] = callback
+        if info:
+            self.pending_request_info[request_id] = info
 
-        if event.wait(timeout):
-            return self.pending_responses.pop(request_id, None)
-        else:
-            self.pending_requests.pop(request_id, None)
-            return None
-
-    def set_response(self, request_id: int, response: Any):
-        """设置响应"""
-        self.pending_responses[request_id] = response
-        event = self.pending_requests.pop(request_id, None)
-        if event:
-            event.set()
+    def handle_response(self, request_id: int, response: Any):
+        """处理响应，调用回调"""
+        callback = self.pending_callbacks.pop(request_id, None)
+        info = self.pending_request_info.pop(request_id, {})
+        if callback:
+            try:
+                callback(response, info)
+            except Exception as e:
+                print(f"❌ Callback error: {e}")
+            return True
+        return False
 
 
 # 全局服务器状态
@@ -264,7 +283,7 @@ class McpHttpHandler(BaseHTTPRequestHandler):
                     self.wfile.write(f'data: {event_data}\n\n'.encode('utf-8'))
                     self.wfile.flush()
 
-                    print(f"📤 Sent SSE event: {event_type}")
+                    debug_print(f"📤 Sent SSE event: {event_type}")
 
                 except queue.Empty:
                     # 发送心跳保持连接
@@ -278,12 +297,12 @@ class McpHttpHandler(BaseHTTPRequestHandler):
             # 只是标记 session 的 SSE 连接已断开
             if session:
                 session.active = False
-            print(f"SSE stream ended for session: {session_id}")
+            debug_print(f"SSE stream ended for session: {session_id}")
 
     def do_POST(self):
         """处理 POST 请求 - JSON-RPC 消息"""
-        print(f"\n📨 Received POST request: {self.path}")
-        print(f"   Headers: {dict(self.headers)}")
+        debug_print(f"\n📨 Received POST request: {self.path}")
+        debug_print(f"   Headers: {dict(self.headers)}")
 
         if not self.path.startswith('/mcp'):
             self.send_error(404)
@@ -307,8 +326,14 @@ class McpHttpHandler(BaseHTTPRequestHandler):
 
         session = server_state.get_session(session_id)
         if not session:
-            session_id = server_state.new_session()
-            session = server_state.get_session(session_id)
+            # 尝试获取一个活跃的 session（处理 Python 重启后 session 不匹配的情况）
+            active_session = get_active_session()
+            if active_session:
+                debug_print(f"  ℹ️ Unknown session {session_id[:8]}..., routing to active session {active_session.session_id[:8]}...")
+                session = active_session
+            else:
+                session_id = server_state.new_session()
+                session = server_state.get_session(session_id)
 
         # 读取请求体
         content_length = int(self.headers.get('Content-Length', 0))
@@ -323,7 +348,7 @@ class McpHttpHandler(BaseHTTPRequestHandler):
         # 打印消息
         method = message.get('method', 'response')
         if method != "ping":
-            print(f"\n📥 Received message: {message.get('method', 'response')}")
+            debug_print(f"\n📥 Received message: {message.get('method', 'response')}")
 
         # 处理消息
         if 'method' in message:
@@ -345,14 +370,14 @@ class McpHttpHandler(BaseHTTPRequestHandler):
         params = request.get('params', {})
         request_id = request.get('id')
 
-        print(f"  Method: {method}")
+        debug_print(f"  Method: {method}")
 
         if method == 'initialize':
             # 处理初始化请求
             session.client_info = params.get('clientInfo', {})
             session.initialized = True
 
-            print(
+            debug_print(
                 f"  Client: {session.client_info.get('name', 'unknown')} v{session.client_info.get('version', 'unknown')}")
 
             response = {
@@ -394,12 +419,22 @@ class McpHttpHandler(BaseHTTPRequestHandler):
     def handle_notification(self, session: ClientSession, notification: Dict):
         """处理客户端通知"""
         method = notification.get('method')
-        print(f"  Notification: {method}")
+        debug_print(f"  Notification: {method}")
 
         if method == 'notifications/initialized':
             print(f"\n✅ Client initialized successfully!")
             print(f"   Session: {session.session_id}")
             print(f"   Client: {session.client_info.get('name', 'unknown')}")
+            
+            # 清理其他非活跃或未初始化的旧会话
+            sessions_to_remove = []
+            for sid, s in server_state.sessions.items():
+                if sid != session.session_id and (not s.active or not s.initialized):
+                    sessions_to_remove.append(sid)
+            
+            for sid in sessions_to_remove:
+                debug_print(f"   🗑️ Removing stale session: {sid[:8]}...")
+                server_state.remove_session(sid)
 
         # 通知不需要响应，返回 202 Accepted
         self.send_response(202)
@@ -409,10 +444,25 @@ class McpHttpHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def handle_response(self, session: ClientSession, response: Dict):
-        """处理客户端响应（对我们发送的请求的响应）"""
+        """处理客户端响应（对我们发送的请求的响应）- 异步回调模式"""
         response_id = response.get('id')
         if response_id:
-            session.set_response(response_id, response)
+            # 首先尝试在当前 session 中处理响应
+            if session.handle_response(response_id, response):
+                pass  # 成功处理
+            else:
+                # 如果当前 session 没有等待这个 response_id，
+                # 尝试在所有活跃 session 中查找（处理重启后 session 不匹配的情况）
+                matched = False
+                for s in server_state.sessions.values():
+                    if response_id in s.pending_callbacks:
+                        debug_print(f"  ℹ️ Routing response {response_id} to session {s.session_id[:8]}...")
+                        s.handle_response(response_id, response)
+                        matched = True
+                        break
+                
+                if not matched:
+                    debug_print(f"  ⚠️ No pending request found for response id: {response_id}")
 
         # 响应不需要回复
         self.send_response(202)
@@ -422,8 +472,9 @@ class McpHttpHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
-def send_tool_request(session: ClientSession, method: str, params: Optional[Dict] = None, timeout: float = DEFAULT_TIMEOUT) -> Optional[Dict]:
-    """发送工具请求到客户端"""
+def send_tool_request_async(session: ClientSession, method: str, params: Optional[Dict] = None, 
+                            callback: ResponseCallback = None, info: Dict = None) -> int:
+    """异步发送工具请求到客户端，响应通过回调处理"""
     request_id = server_state.next_request_id()
 
     request = {
@@ -434,30 +485,121 @@ def send_tool_request(session: ClientSession, method: str, params: Optional[Dict
     if params:
         request['params'] = params
 
+    # 注册回调
+    if callback:
+        session.register_callback(request_id, callback, info)
+
     # 通过 SSE 发送请求
     session.send_sse_event('message', request)
 
+    return request_id
+
+
+def send_tool_request(session: ClientSession, method: str, params: Optional[Dict] = None, timeout: float = DEFAULT_TIMEOUT) -> Optional[Dict]:
+    """同步发送工具请求到客户端（兼容旧代码，仅用于 list 等简单命令）"""
+    result_holder = {'response': None, 'event': threading.Event()}
+    
+    def sync_callback(response, info=None):
+        result_holder['response'] = response
+        result_holder['event'].set()
+    
+    request_id = send_tool_request_async(session, method, params, sync_callback)
+    
     # 等待响应
-    response = session.wait_response(request_id, timeout=timeout)
-    return response
+    if result_holder['event'].wait(timeout):
+        return result_holder['response']
+    else:
+        # 超时，清理回调
+        session.pending_callbacks.pop(request_id, None)
+        session.pending_request_info.pop(request_id, None)
+        return None
 
 
-def call_tool(session: ClientSession, tool_name: str, args: Dict = None):
-    """调用工具并打印结果"""
-    if args is None:
-        args = {}
+def parse_cli_args(args_list: List[str]) -> Dict:
+    """
+    解析命令行风格的参数
+    
+    支持格式:
+    - --key value
+    - --key=value
+    - -key value
+    - --flag (布尔值，设为 true)
+    
+    示例:
+    parse_cli_args(['--action', 'heapAnalyze', '--classNum', '5'])
+    => {'action': 'heapAnalyze', 'classNum': 5}
+    """
+    result = {}
+    i = 0
+    while i < len(args_list):
+        arg = args_list[i]
+        
+        # 跳过非参数项
+        if not arg.startswith('-'):
+            i += 1
+            continue
+        
+        # 去掉前缀 -- 或 -
+        if arg.startswith('--'):
+            key = arg[2:]
+        else:
+            key = arg[1:]
+        
+        # 检查是否是 --key=value 格式
+        if '=' in key:
+            key, value = key.split('=', 1)
+            result[key] = try_parse_value(value)
+            i += 1
+            continue
+        
+        # 检查下一个参数是否是值
+        if i + 1 < len(args_list) and not args_list[i + 1].startswith('-'):
+            value = args_list[i + 1]
+            result[key] = try_parse_value(value)
+            i += 2
+        else:
+            # 没有值，作为布尔标志
+            result[key] = True
+            i += 1
+    
+    return result
 
-    # 根据工具类型选择超时时间
-    timeout = STREAMABLE_TIMEOUT if tool_name in STREAMABLE_TOOLS else DEFAULT_TIMEOUT
-    print(f"📤 Calling {tool_name} tool... (timeout: {int(timeout)}s)")
-    params = {'name': tool_name, 'arguments': args}
-    response = send_tool_request(session, 'tools/call', params, timeout=timeout)
 
+def try_parse_value(value: str):
+    """
+    尝试将字符串值解析为适当的类型
+    """
+    # 尝试解析为整数
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    
+    # 尝试解析为浮点数
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    
+    # 尝试解析为布尔值
+    if value.lower() in ('true', 'yes', 'on', '1'):
+        return True
+    if value.lower() in ('false', 'no', 'off', '0'):
+        return False
+    
+    # 返回原始字符串
+    return value
+
+
+def print_tool_response(response: Dict, info: Dict = None):
+    """打印工具响应结果（回调函数）"""
+    tool_name = info.get('tool_name', 'unknown') if info else 'unknown'
+    
     if response:
         if 'result' in response:
             result = response['result']
             content = result.get('content', [])
-            print(f"\n✅ Tool result:")
+            print(f"\n✅ [{tool_name}] Tool result:")
             for item in content:
                 if item.get('type') == 'text':
                     text = item.get('text', '')
@@ -469,9 +611,38 @@ def call_tool(session: ClientSession, tool_name: str, args: Dict = None):
                         # 直接打印源代码文本
                         print(text)
         elif 'error' in response:
-            print(f"❌ Error: {response['error'].get('message', 'Unknown error')}")
+            print(f"\n❌ [{tool_name}] Error: {response['error'].get('message', 'Unknown error')}")
     else:
-        print("❌ Request timeout")
+        print(f"\n❌ [{tool_name}] No response")
+    
+    # 打印提示符，让用户知道可以继续输入
+    print("\n>>> ", end='', flush=True)
+
+
+def call_tool(session: ClientSession, tool_name: str, args: Dict = None):
+    """调用工具（异步模式，立即返回）"""
+    if args is None:
+        args = {}
+
+    print(f"📤 Calling {tool_name}...")
+    debug_print(f"   Arguments: {json.dumps(args, ensure_ascii=False)}")
+    
+    params = {'name': tool_name, 'arguments': args}
+    info = {'tool_name': tool_name, 'args': args, 'start_time': time.time()}
+    
+    # 异步发送请求，响应到达时通过回调打印
+    request_id = send_tool_request_async(session, 'tools/call', params, print_tool_response, info)
+    print(f"   Request sent (id: {request_id}), waiting for response...")
+
+
+def get_active_session() -> Optional[ClientSession]:
+    """获取一个活跃且已初始化的会话"""
+    sessions = list(server_state.sessions.values())
+    # 过滤：只选择 active=True 且 initialized=True 的会话
+    active_sessions = [s for s in sessions if s.active and s.initialized]
+    if active_sessions:
+        return active_sessions[0]
+    return None
 
 
 def interactive_cli(server_state: ServerState):
@@ -508,20 +679,19 @@ def interactive_cli(server_state: ServerState):
             elif command == 'sessions':
                 sessions = list(server_state.sessions.values())
                 if not sessions:
-                    print("No active sessions")
+                    print("No sessions")
                 else:
-                    print(f"Active sessions: {len(sessions)}")
+                    print(f"Total sessions: {len(sessions)}")
                     for s in sessions:
-                        print(f"  - {s.session_id[:8]}... ({s.client_info.get('name', 'unknown')})")
+                        status = "✅ active" if (s.active and s.initialized) else "⏳ pending" if s.active else "❌ closed"
+                        print(f"  - {s.session_id[:8]}... ({s.client_info.get('name', 'unknown')}) [{status}]")
 
             elif command in ['list', 'call']:
-                # 需要选择一个会话
-                sessions = list(server_state.sessions.values())
-                if not sessions:
-                    print("❌ No active client sessions")
+                # 需要选择一个已初始化且活跃的会话
+                session = get_active_session()
+                if not session:
+                    print("❌ No active client sessions (waiting for initialized connection)")
                     continue
-
-                session = sessions[0]  # 使用第一个会话
 
                 if command == 'list':
                     print(f"📤 Requesting tools list...")
@@ -562,13 +732,11 @@ def interactive_cli(server_state: ServerState):
                     print("Type 'help' for available commands")
                     continue
 
-                sessions = list(server_state.sessions.values())
-                if not sessions:
+                session = get_active_session()
+                if not session:
                     print(f"❌ No active client sessions")
-                    print("Please wait for a client to connect first")
+                    print("Please wait for an initialized client connection first")
                     continue
-
-                session = sessions[0]
                 tool_name = command
                 args = {}
 
@@ -577,11 +745,20 @@ def interactive_cli(server_state: ServerState):
                     arg_str = parts[1]
                     # 如果参数以 { 或 [ 开头，尝试解析为 JSON
                     if arg_str.startswith('{') or arg_str.startswith('['):
+                        # JSON 参数可能包含空格，需要合并 parts[1] 和 parts[2]（如果有）
+                        full_json = ' '.join(parts[1:])
                         try:
-                            args = json.loads(arg_str)
+                            args = json.loads(full_json)
                         except json.JSONDecodeError:
-                            print(f"❌ Invalid JSON arguments: {arg_str}")
+                            print(f"❌ Invalid JSON arguments: {full_json}")
                             continue
+                    # 检查是否是命令行风格参数 (--key value 或 -key value)
+                    elif arg_str.startswith('-'):
+                        # 重新分割完整命令以获取所有参数（不限制分割数量）
+                        # 例如: vmtool --action heapAnalyze --classNum 5 --objectNum 3
+                        # 变为: ['vmtool', '--action', 'heapAnalyze', '--classNum', '5', '--objectNum', '3']
+                        all_parts = cmd.split()
+                        args = parse_cli_args(all_parts[1:])
                     else:
                         # 否则作为普通字符串参数，根据工具名选择合适的参数名
                         # 需要两个参数的工具 (classPattern + methodPattern)

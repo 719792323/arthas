@@ -9,13 +9,19 @@ public class VMToolTool extends AbstractArthasTool {
 
     public static final String ACTION_GET_INSTANCES = "getInstances";
     public static final String ACTION_INTERRUPT_THREAD = "interruptThread";
+    public static final String ACTION_HEAP_ANALYZE = "heapAnalyze";
+    
+    // heapAnalyze 默认参数
+    private static final int DEFAULT_HEAP_ANALYZE_POLL_INTERVAL_MS = 200;
+    private static final int DEFAULT_HEAP_ANALYZE_TIMEOUT_SECONDS = 60;
 
     @Tool(
             name = "vmtool",
-            description = "虚拟机工具诊断工具: 查询实例、强制 GC、线程中断等，对应 Arthas 的 vmtool 命令。"
+            description = "虚拟机工具诊断工具: 查询实例、强制 GC、线程中断、堆内存分析等，对应 Arthas 的 vmtool 命令。",
+            streamable = true
     )
     public String vmtool(
-            @ToolParam(description = "操作类型: getInstances/forceGc/interruptThread 等")
+            @ToolParam(description = "操作类型: getInstances/forceGc/interruptThread/heapAnalyze 等", required = true)
             String action,
 
             @ToolParam(description = "ClassLoader的hashcode（16进制），用于指定特定的ClassLoader", required = false)
@@ -38,6 +44,12 @@ public class VMToolTool extends AbstractArthasTool {
 
             @ToolParam(description = "线程 ID (-t)，interruptThread 时使用", required = false)
             Long threadId,
+
+            @ToolParam(description = "heapAnalyze 输出类数量，默认 20", required = false)
+            Integer classNum,
+
+            @ToolParam(description = "heapAnalyze 输出每个类的对象数量，默认 20", required = false)
+            Integer objectNum,
 
             ToolContext toolContext
     ) {
@@ -77,6 +89,23 @@ public class VMToolTool extends AbstractArthasTool {
             }
         }
 
+        // heapAnalyze 参数处理
+        if (ACTION_HEAP_ANALYZE.equals(action.trim())) {
+            if (classNum != null && classNum > 0) {
+                cmd.append(" --classNum ").append(classNum);
+            }
+            if (objectNum != null && objectNum > 0) {
+                cmd.append(" --objectNum ").append(objectNum);
+            }
+            // heapAnalyze 需要等待结果，使用 executeStreamable
+            return executeStreamable(toolContext, cmd.toString(), 
+                    1, // 期望 1 个结果
+                    DEFAULT_HEAP_ANALYZE_POLL_INTERVAL_MS,
+                    DEFAULT_HEAP_ANALYZE_TIMEOUT_SECONDS * 1000,
+                    "Heap analysis completed successfully");
+        }
+
+        // 其他 action（getInstances, forceGc, interruptThread 等）使用同步执行
         return executeSync(toolContext, cmd.toString());
     }
 

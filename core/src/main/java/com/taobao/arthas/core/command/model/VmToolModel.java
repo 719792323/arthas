@@ -12,6 +12,9 @@ public class VmToolModel extends ResultModel {
 
     private Collection<ClassLoaderVO> matchedClassLoaders;
     private String classLoaderClass;
+    
+    // heapAnalyze 结果
+    private String heapAnalyzeResult;
 
 
     @Override
@@ -43,6 +46,15 @@ public class VmToolModel extends ResultModel {
 
     public VmToolModel setMatchedClassLoaders(Collection<ClassLoaderVO> matchedClassLoaders) {
         this.matchedClassLoaders = matchedClassLoaders;
+        return this;
+    }
+
+    public String getHeapAnalyzeResult() {
+        return heapAnalyzeResult;
+    }
+
+    public VmToolModel setHeapAnalyzeResult(String heapAnalyzeResult) {
+        this.heapAnalyzeResult = heapAnalyzeResult;
         return this;
     }
 }
