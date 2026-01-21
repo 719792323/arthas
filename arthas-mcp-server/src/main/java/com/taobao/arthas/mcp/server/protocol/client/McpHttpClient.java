@@ -136,6 +136,13 @@ public class McpHttpClient {
             return future;
         }
         
+        // 关闭旧的 SSE 连接（如果存在）
+        if (sseChannel != null && sseChannel.isOpen()) {
+            logger.warn("Closing existing SSE channel before creating new connection");
+            sseChannel.close();
+            sseChannel = null;
+        }
+        
         try {
             Bootstrap bootstrap = new Bootstrap();
             bootstrap.group(eventLoopGroup)
@@ -378,6 +385,18 @@ public class McpHttpClient {
      */
     public void setConnectionLostHandler(Runnable handler) {
         this.connectionLostHandler = handler;
+    }
+
+    /**
+     * 关闭 SSE Channel
+     */
+    public void closeSseChannel() {
+        if (sseChannel != null && sseChannel.isOpen()) {
+            logger.info("Closing SSE channel");
+            sseChannel.close();
+            sseChannel = null;
+            sseConnected = false;
+        }
     }
 
     /**

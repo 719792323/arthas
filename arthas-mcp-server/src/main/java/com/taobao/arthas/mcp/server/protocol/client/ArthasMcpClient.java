@@ -296,6 +296,11 @@ public class ArthasMcpClient {
                 heartbeatManager.stop();
             }
 
+            // 关闭旧的 SSE 连接
+            if (httpClient != null) {
+                httpClient.closeSseChannel();
+            }
+
             // 重置协议状态
             protocolHandler.reset();
 
