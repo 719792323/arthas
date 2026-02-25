@@ -15,10 +15,15 @@ import org.slf4j.LoggerFactory;
  * <p>
  * 使用方式：
  * 1. 设置环境变量：
- * export ARTHAS_MCP_CLIENT_SERVER_URL=http://localhost:8080/mcp
+ * export ARTHAS_MCP_CLIENT_SERVER_URL=ws://localhost:8080/mcp
  * export ARTHAS_MCP_CLIENT_AUTH_TOKEN=your-token
+ * export ARTHAS_MCP_CLIENT_TRANSPORT_TYPE=WEBSOCKET  (可选，默认 WEBSOCKET)
  * <p>
- * 2. 运行测试：
+ * 2. 使用 HTTP/SSE 模式：
+ * export ARTHAS_MCP_CLIENT_SERVER_URL=http://localhost:8080/mcp
+ * export ARTHAS_MCP_CLIENT_TRANSPORT_TYPE=HTTP_SSE
+ * <p>
+ * 3. 运行测试：
  * java -cp arthas-mcp-server.jar com.taobao.arthas.mcp.server.protocol.client.McpClientBootstrap
  *
  * @author Arthas Team
@@ -34,9 +39,10 @@ public class McpClientBootstrap {
 
         // 从环境变量获取配置
         String serverUrl = System.getenv(McpClientConfig.ENV_SERVER_URL);
+        serverUrl = "ws://localhost:8080/mcp";
         if (serverUrl == null || serverUrl.isEmpty()) {
-            // 默认测试地址
-            serverUrl = "http://localhost:8080/mcp";
+            // 默认测试地址（WebSocket 模式）
+            serverUrl = "ws://localhost:8080/mcp";
             logger.warn("Environment variable {} not set, using default: {}", McpClientConfig.ENV_SERVER_URL, serverUrl);
         }
 
@@ -45,15 +51,30 @@ public class McpClientBootstrap {
             logger.info("No auth token configured");
         }
 
+        // 确定传输类型
+        McpClientConfig.TransportType transportType = McpClientConfig.TransportType.WEBSOCKET;
+        String transportTypeStr = System.getenv(McpClientConfig.ENV_TRANSPORT_TYPE);
+        if (transportTypeStr != null && !transportTypeStr.isEmpty()) {
+            try {
+                transportType = McpClientConfig.TransportType.valueOf(transportTypeStr.toUpperCase());
+            } catch (IllegalArgumentException e) {
+                logger.warn("Invalid transport type: {}, using default WEBSOCKET", transportTypeStr);
+            }
+        } else if (serverUrl.startsWith("ws://") || serverUrl.startsWith("wss://")) {
+            transportType = McpClientConfig.TransportType.WEBSOCKET;
+        } else if (serverUrl.startsWith("http://") || serverUrl.startsWith("https://")) {
+            transportType = McpClientConfig.TransportType.HTTP_SSE;
+        }
+
+        logger.info("Transport type: {}", transportType);
+
         try {
             // 创建工具提供者
             DefaultToolCallbackProvider toolProvider = new DefaultToolCallbackProvider();
             // 设置测试工具路径
             toolProvider.setToolBasePackage("com.taobao.arthas.mcp.server.tool.function");
             // 创建客户端
-            ArthasMcpClient client = ArthasMcpClient.create(serverUrl).authToken(authToken)
-                    .reconnectEnabled(true).heartbeatEnabled(true).heartbeatInterval(30000)
-                    .connectTimeout(10000).requestTimeout(30000).toolCallbackProvider(toolProvider).build();
+            ArthasMcpClient client = ArthasMcpClient.create(serverUrl).authToken(authToken).transportType(transportType).reconnectEnabled(true).heartbeatEnabled(true).heartbeatInterval(30000).connectTimeout(10000).requestTimeout(30000).toolCallbackProvider(toolProvider).build();
 
             // 启动客户端
             logger.info("Starting MCP Client...");

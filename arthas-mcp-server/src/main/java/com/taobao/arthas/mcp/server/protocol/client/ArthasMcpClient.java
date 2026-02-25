@@ -6,6 +6,7 @@ package com.taobao.arthas.mcp.server.protocol.client;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.taobao.arthas.mcp.server.CommandExecutor;
+import com.taobao.arthas.mcp.server.protocol.client.ws.McpWebSocketClient;
 import com.taobao.arthas.mcp.server.protocol.spec.McpSchema;
 import com.taobao.arthas.mcp.server.tool.ToolCallback;
 import com.taobao.arthas.mcp.server.tool.ToolCallbackProvider;
@@ -14,31 +15,34 @@ import com.taobao.arthas.mcp.server.util.JsonParser;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.concurrent.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Arthas MCP Client 主类
- * 
+ * <p>
  * 主动连接到公网智能体/管控平台，提供 MCP 工具服务
- * 
- * 基于 HTTP/SSE 协议：
- * 1. 通过 HTTP POST 发送 JSON-RPC 请求/响应
- * 2. 通过 SSE 长连接接收管控平台的请求
- * 
+ * <p>
+ * 支持两种传输模式：
+ * 1. WebSocket（默认）：通过单一 WebSocket 连接进行双向全双工通信
+ * 2. HTTP/SSE：通过 HTTP POST 发送请求/响应，通过 SSE 长连接接收请求
+ * <p>
  * 复用的组件：
  * - ToolCallbackProvider: 工具提供者
  * - McpSchema: JSON-RPC 消息定义
  * - JsonParser: JSON 序列化
  * - Netty: 网络通信框架
- *
+ * <p>
  * 使用示例：
  * <pre>{@code
  * ArthasMcpClient client = ArthasMcpClient.create("http://localhost:8080/mcp")
  *     .authToken("your-token")
  *     .toolCallbackProvider(provider)
  *     .build();
- * 
+ *
  * client.start()
  *     .thenRun(() -> System.out.println("Connected!"))
  *     .exceptionally(ex -> { ex.printStackTrace(); return null; });
@@ -65,7 +69,7 @@ public class ArthasMcpClient {
     private final ObjectMapper objectMapper;
     private final AtomicReference<State> state = new AtomicReference<>(State.DISCONNECTED);
 
-    private McpHttpClient httpClient;
+    private McpTransport transport;
     private McpClientProtocolHandler protocolHandler;
     private HeartbeatManager heartbeatManager;
     private ReconnectStrategy reconnectStrategy;
@@ -73,8 +77,14 @@ public class ArthasMcpClient {
     private ToolCallbackProvider toolCallbackProvider;
     private CommandExecutor commandExecutor;
     private ScheduledExecutorService scheduler;
-    
+
     private volatile CompletableFuture<Void> startFuture;
+
+    /**
+     * 由 Arthas 客户端生成的 MCP Session ID，在建立连接时主动发送给管控平台。
+     * 在客户端生命周期内保持不变，重连时复用同一 ID，便于管控平台识别同一客户端。
+     */
+    private final String mcpSessionId;
 
     /**
      * 创建客户端（使用环境变量配置）
@@ -96,14 +106,12 @@ public class ArthasMcpClient {
     public ArthasMcpClient(McpClientConfig config) {
         Assert.notNull(config, "config must not be null");
         config.validate();
-        
+
         this.config = config;
         this.objectMapper = JsonParser.getObjectMapper();
-        this.reconnectStrategy = new ReconnectStrategy(
-                config.getReconnect().getInitialDelay(),
-                config.getReconnect().getMaxDelay(),
-                config.getReconnect().getMultiplier()
-        );
+        //        this.mcpSessionId = UUID.randomUUID().toString();
+        this.mcpSessionId = "test";
+        this.reconnectStrategy = new ReconnectStrategy(config.getReconnect().getInitialDelay(), config.getReconnect().getMaxDelay(), config.getReconnect().getMultiplier());
     }
 
     /**
@@ -135,7 +143,7 @@ public class ArthasMcpClient {
         }
 
         startFuture = new CompletableFuture<>();
-        
+
         logger.info("Starting Arthas MCP Client...");
         logger.info("Server URL: {}", config.getServerUrl());
 
@@ -149,7 +157,7 @@ public class ArthasMcpClient {
 
             // 初始化协议处理器
             protocolHandler = new McpClientProtocolHandler(config, objectMapper, commandExecutor);
-            
+
             // 注册工具
             if (toolCallbackProvider != null) {
                 ToolCallback[] callbacks = toolCallbackProvider.getToolCallbacks();
@@ -157,30 +165,49 @@ public class ArthasMcpClient {
                 logger.info("Registered {} tools", callbacks != null ? callbacks.length : 0);
             }
 
-            // 初始化 HTTP 客户端
-            httpClient = new McpHttpClient(config, objectMapper);
-            protocolHandler.setHttpClient(httpClient);
+            // 根据传输类型创建传输层实例
+            McpClientConfig.TransportType transportType = config.getTransportType();
+            logger.info("Transport type: {}", transportType);
+
+            if (transportType == McpClientConfig.TransportType.WEBSOCKET) {
+                transport = new McpWebSocketClient(config, objectMapper);
+            } else {
+                transport = new McpHttpClient(config, objectMapper);
+            }
+            protocolHandler.setTransport(transport);
+            // 将 mcpSessionId 传递给协议处理器，确保命令会话管理使用相同的 sessionId
+            protocolHandler.setMcpSessionId(mcpSessionId);
 
             // 设置消息处理器
-            httpClient.setMessageHandler(protocolHandler::handleMessage);
-            
+            transport.setMessageHandler(protocolHandler::handleMessage);
+
             // 设置连接丢失处理器
-            httpClient.setConnectionLostHandler(this::onConnectionLost);
+            transport.setConnectionLostHandler(this::onConnectionLost);
+
+            // 在连接前设置由 Arthas 客户端生成的 mcpSessionId，连接时会主动发送给管控平台
+            transport.setSessionId(mcpSessionId);
+            logger.info("Generated mcpSessionId: {}", mcpSessionId);
 
             // 初始化并连接
-            httpClient.init()
-                    .thenCompose(v -> connect())
-                    .thenRun(() -> {
-                        state.set(State.CONNECTED);
-                        startFuture.complete(null);
-                        logger.info("Arthas MCP Client started successfully");
-                    })
-                    .exceptionally(ex -> {
-                        logger.error("Failed to start Arthas MCP Client", ex);
-                        state.set(State.DISCONNECTED);
-                        startFuture.completeExceptionally(ex);
-                        return null;
-                    });
+            transport.init().thenCompose(v -> connect()).thenRun(() -> {
+                state.set(State.CONNECTED);
+                startFuture.complete(null);
+                logger.info("Arthas MCP Client started successfully");
+            }).exceptionally(ex -> {
+                logger.error("Failed to start Arthas MCP Client", ex);
+
+                // 首次连接失败时，如果启用了重连，则触发重连逻辑
+                if (config.getReconnect().isEnabled()) {
+                    logger.info("首次连接失败，启动重连策略...");
+                    state.set(State.RECONNECTING);
+                    scheduleReconnect();
+                    // 注意：startFuture 不在此处完成，等重连成功后再完成
+                } else {
+                    state.set(State.DISCONNECTED);
+                    startFuture.completeExceptionally(ex);
+                }
+                return null;
+            });
 
         } catch (Exception e) {
             state.set(State.DISCONNECTED);
@@ -196,15 +223,14 @@ public class ArthasMcpClient {
     private CompletableFuture<Void> connect() {
         logger.info("Connecting to server...");
 
-        // 1. 建立 SSE 连接
-        return httpClient.connectSse()
+        // 1. 建立连接
+        return transport.connect()
                 // 2. 发送 initialize 请求
                 .thenCompose(v -> protocolHandler.sendInitialize())
                 // 3. 发送 initialized 通知
                 .thenCompose(result -> protocolHandler.sendInitialized())
                 // 4. 启动心跳
-                .thenRun(this::startHeartbeat)
-                .thenRun(() -> {
+                .thenRun(this::startHeartbeat).thenRun(() -> {
                     reconnectStrategy.reset();
                     logger.info("Connection established successfully");
                 });
@@ -222,29 +248,22 @@ public class ArthasMcpClient {
             heartbeatManager.stop();
         }
 
-        heartbeatManager = new HeartbeatManager(
-                config.getHeartbeat().getInterval(),
-                config.getHeartbeat().getTimeout(),
-                scheduler
-        );
+        heartbeatManager = new HeartbeatManager(config.getHeartbeat().getInterval(), config.getHeartbeat().getTimeout(), scheduler);
 
         heartbeatManager.start(
                 // 发送心跳
-                () -> protocolHandler.sendPing()
-                        .thenRun(() -> {
-                            // ping 成功，更新 lastPongTime
-                            heartbeatManager.onPong();
-                        })
-                        .exceptionally(ex -> {
-                            logger.warn("Heartbeat failed: {}", ex.getMessage());
-                            return null;
-                        }),
+                () -> protocolHandler.sendPing().thenRun(() -> {
+                    // ping 成功，更新 lastPongTime
+                    heartbeatManager.onPong();
+                }).exceptionally(ex -> {
+                    logger.warn("Heartbeat failed: {}", ex.getMessage());
+                    return null;
+                }),
                 // 心跳超时
                 () -> {
                     logger.warn("Heartbeat timeout, triggering reconnect");
                     onConnectionLost();
-                }
-        );
+                });
 
         logger.debug("Heartbeat started, interval: {} ms", config.getHeartbeat().getInterval());
     }
@@ -265,8 +284,8 @@ public class ArthasMcpClient {
             return;
         }
 
-        if (state.compareAndSet(State.CONNECTED, State.RECONNECTING) ||
-                state.compareAndSet(State.CONNECTING, State.RECONNECTING)) {
+        if (state.compareAndSet(State.CONNECTED, State.RECONNECTING)
+                || state.compareAndSet(State.CONNECTING, State.RECONNECTING)) {
             scheduleReconnect();
         }
     }
@@ -281,7 +300,7 @@ public class ArthasMcpClient {
 
         long delay = reconnectStrategy.getNextDelay();
         int attempt = reconnectStrategy.getAttemptCount();
-        
+
         logger.info("Scheduling reconnect attempt {} in {}ms", attempt, delay);
 
         scheduler.schedule(() -> {
@@ -296,27 +315,29 @@ public class ArthasMcpClient {
                 heartbeatManager.stop();
             }
 
-            // 关闭旧的 SSE 连接
-            if (httpClient != null) {
-                httpClient.closeSseChannel();
+            // 关闭旧的连接通道
+            if (transport != null) {
+                transport.closeChannel();
             }
 
             // 重置协议状态
             protocolHandler.reset();
 
             // 重新连接
-            connect()
-                    .thenRun(() -> {
-                        state.set(State.CONNECTED);
-                        logger.info("Reconnected successfully after {} attempts", attempt);
-                    })
-                    .exceptionally(ex -> {
-                        logger.warn("Reconnect attempt {} failed: {}", attempt, ex.getMessage());
-                        if (state.get() == State.RECONNECTING) {
-                            scheduleReconnect();
-                        }
-                        return null;
-                    });
+            connect().thenRun(() -> {
+                state.set(State.CONNECTED);
+                logger.info("Reconnected successfully after {} attempts", attempt);
+                // 如果是首次连接失败后的重连，完成 startFuture
+                if (startFuture != null && !startFuture.isDone()) {
+                    startFuture.complete(null);
+                }
+            }).exceptionally(ex -> {
+                logger.warn("Reconnect attempt {} failed: {}", attempt, ex.getMessage());
+                if (state.get() == State.RECONNECTING) {
+                    scheduleReconnect();
+                }
+                return null;
+            });
         }, delay, TimeUnit.MILLISECONDS);
     }
 
@@ -336,9 +357,9 @@ public class ArthasMcpClient {
             heartbeatManager.stop();
         }
 
-        // 关闭 HTTP 客户端
-        CompletableFuture<Void> closeFuture = httpClient != null ? 
-                httpClient.close() : CompletableFuture.completedFuture(null);
+        // 关闭传输层
+        CompletableFuture<Void> closeFuture =
+                transport != null ? transport.close() : CompletableFuture.completedFuture(null);
 
         return closeFuture.thenRun(() -> {
             // 关闭调度器
@@ -368,8 +389,7 @@ public class ArthasMcpClient {
      * 是否已连接
      */
     public boolean isConnected() {
-        return state.get() == State.CONNECTED && 
-                httpClient != null && httpClient.isSseConnected();
+        return state.get() == State.CONNECTED && transport != null && transport.isConnected();
     }
 
     /**
@@ -436,6 +456,16 @@ public class ArthasMcpClient {
 
         public Builder clientVersion(String version) {
             configBuilder.clientVersion(version);
+            return this;
+        }
+
+        public Builder transportType(McpClientConfig.TransportType type) {
+            configBuilder.transportType(type);
+            return this;
+        }
+
+        public Builder taskStageTrackingEnabled(boolean enabled) {
+            configBuilder.taskStageTrackingEnabled(enabled);
             return this;
         }
 

@@ -1513,10 +1513,12 @@ public final class McpSchema {
         }
 
         @Override
+        @JsonProperty("_meta")
         public Map<String, Object> meta() {
             return meta;
         }
 
+        @JsonIgnore
         public Map<String, Object> getMeta() {
             return meta();
         }

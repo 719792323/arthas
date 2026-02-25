@@ -52,7 +52,7 @@ import java.util.function.Consumer;
  *
  * @author Arthas Team
  */
-public class McpHttpClient {
+public class McpHttpClient implements McpTransport {
 
     private static final Logger logger = LoggerFactory.getLogger(McpHttpClient.class);
 
@@ -121,6 +121,16 @@ public class McpHttpClient {
         }
         
         return future;
+    }
+
+    /**
+     * 建立连接（实现 McpTransport 接口）
+     * <p>
+     * 对于 HTTP/SSE 模式，即建立 SSE 长连接。
+     */
+    @Override
+    public CompletableFuture<Void> connect() {
+        return connectSse();
     }
 
     /**
@@ -215,13 +225,19 @@ public class McpHttpClient {
             request.headers().set(HttpHeaderNames.AUTHORIZATION, "Bearer " + config.getAuthToken());
         }
         
+        // 添加 session id 头（如果有）
+        if (sessionId != null) {
+            request.headers().set("Mcp-Session-Id", sessionId);
+        }
+        
         channel.writeAndFlush(request);
-        logger.debug("Sent SSE request to {}", uri);
+        logger.debug("Sent SSE request to {}, sessionId={}", uri, sessionId);
     }
 
     /**
      * 发送 JSON-RPC 请求并等待响应
      */
+    @Override
     public CompletableFuture<McpSchema.JSONRPCResponse> sendRequest(McpSchema.JSONRPCRequest request) {
         CompletableFuture<McpSchema.JSONRPCResponse> future = new CompletableFuture<>();
         
@@ -250,6 +266,7 @@ public class McpHttpClient {
     /**
      * 发送 JSON-RPC 响应
      */
+    @Override
     public CompletableFuture<Void> sendResponse(McpSchema.JSONRPCResponse response) {
         CompletableFuture<Void> future = new CompletableFuture<>();
         
@@ -266,6 +283,7 @@ public class McpHttpClient {
     /**
      * 发送 JSON-RPC 通知
      */
+    @Override
     public CompletableFuture<Void> sendNotification(McpSchema.JSONRPCNotification notification) {
         CompletableFuture<Void> future = new CompletableFuture<>();
         
@@ -369,6 +387,7 @@ public class McpHttpClient {
     /**
      * 生成请求 ID
      */
+    @Override
     public long nextRequestId() {
         return requestIdGenerator.getAndIncrement();
     }
@@ -376,6 +395,7 @@ public class McpHttpClient {
     /**
      * 设置消息处理器
      */
+    @Override
     public void setMessageHandler(Consumer<McpSchema.JSONRPCMessage> handler) {
         this.messageHandler = handler;
     }
@@ -383,8 +403,17 @@ public class McpHttpClient {
     /**
      * 设置连接丢失处理器
      */
+    @Override
     public void setConnectionLostHandler(Runnable handler) {
         this.connectionLostHandler = handler;
+    }
+
+    /**
+     * 关闭当前连接通道（实现 McpTransport 接口）
+     */
+    @Override
+    public void closeChannel() {
+        closeSseChannel();
     }
 
     /**
@@ -402,6 +431,7 @@ public class McpHttpClient {
     /**
      * 关闭客户端
      */
+    @Override
     public CompletableFuture<Void> close() {
         CompletableFuture<Void> future = new CompletableFuture<>();
         
@@ -438,6 +468,14 @@ public class McpHttpClient {
     }
 
     /**
+     * 连接是否处于活跃状态（实现 McpTransport 接口）
+     */
+    @Override
+    public boolean isConnected() {
+        return isSseConnected();
+    }
+
+    /**
      * SSE 是否已连接
      */
     public boolean isSseConnected() {
@@ -447,6 +485,7 @@ public class McpHttpClient {
     /**
      * 获取 Session ID
      */
+    @Override
     public String getSessionId() {
         return sessionId;
     }
@@ -454,6 +493,7 @@ public class McpHttpClient {
     /**
      * 设置 Session ID
      */
+    @Override
     public void setSessionId(String sessionId) {
         this.sessionId = sessionId;
     }
@@ -492,13 +532,11 @@ public class McpHttpClient {
                     return;
                 }
                 
-                // 获取 session id
-                String newSessionId = response.headers().get("Mcp-Session-Id");
-                if (newSessionId != null) {
-                    sessionId = newSessionId;
-                    logger.info("Received session ID from SSE response: {}", sessionId);
-                } else {
-                    logger.warn("No Mcp-Session-Id in SSE response headers!");
+                // 注意：sessionId 由 Arthas 客户端生成并主动发送给管控平台，不从响应头覆盖
+                String serverSessionId = response.headers().get("Mcp-Session-Id");
+                if (serverSessionId != null) {
+                    logger.info("SSE response contains server Mcp-Session-Id: {}, client sessionId: {}", 
+                            serverSessionId, sessionId);
                 }
                 
                 headersReceived = true;
@@ -653,10 +691,10 @@ public class McpHttpClient {
                 logger.debug("Received HTTP response: status={}, contentType={}, body={}", 
                         response.status(), contentType, body);
                 
-                // 获取 session id
-                String newSessionId = response.headers().get("Mcp-Session-Id");
-                if (newSessionId != null) {
-                    sessionId = newSessionId;
+                // 注意：sessionId 由 Arthas 客户端生成，不从响应头覆盖
+                String serverSessionId = response.headers().get("Mcp-Session-Id");
+                if (serverSessionId != null) {
+                    logger.debug("POST response contains server Mcp-Session-Id: {}", serverSessionId);
                 }
                 
                 if (response.status().code() >= 400) {

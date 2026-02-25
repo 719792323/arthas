@@ -7,7 +7,6 @@ import org.slf4j.LoggerFactory;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -20,7 +19,7 @@ public class ArthasCommandContext {
 
     private static final Logger logger = LoggerFactory.getLogger(ArthasCommandContext.class);
 
-    private static final long DEFAULT_SYNC_TIMEOUT = 30000L;
+    private static final long DEFAULT_SYNC_TIMEOUT = 60000L * 10;
 
     private final CommandExecutor commandExecutor;
     private final ArthasCommandSessionManager.CommandSessionBinding binding;
@@ -33,7 +32,8 @@ public class ArthasCommandContext {
         this.binding = null;
     }
 
-    public ArthasCommandContext(CommandExecutor commandExecutor, ArthasCommandSessionManager.CommandSessionBinding binding) {
+    public ArthasCommandContext(CommandExecutor commandExecutor,
+                                ArthasCommandSessionManager.CommandSessionBinding binding) {
         this.commandExecutor = Objects.requireNonNull(commandExecutor, "commandExecutor cannot be null");
         this.binding = binding;
     }
@@ -56,11 +56,11 @@ public class ArthasCommandContext {
 
     private void requireSessionSupport() {
         if (binding == null) {
-            throw new IllegalStateException("Session-based operations are not supported in temporary mode. " +
-                    "Use ArthasCommandContext(CommandExecutor, CommandSessionBinding) constructor to enable session support.");
+            throw new IllegalStateException("Session-based operations are not supported in temporary mode. "
+                    + "Use ArthasCommandContext(CommandExecutor, CommandSessionBinding) constructor to enable session support.");
         }
     }
-    
+
     public String getConsumerId() {
         return binding != null ? binding.getConsumerId() : null;
     }
@@ -117,9 +117,9 @@ public class ArthasCommandContext {
     /**
      * Execute command synchronously with auth subject and userId
      *
-     * @param commandStr 命令行
+     * @param commandStr  命令行
      * @param authSubject 认证主体
-     * @param userId 用户 ID，用于统计上报
+     * @param userId      用户 ID，用于统计上报
      * @return 执行结果
      */
     public Map<String, Object> executeSync(String commandStr, Object authSubject, String userId) {

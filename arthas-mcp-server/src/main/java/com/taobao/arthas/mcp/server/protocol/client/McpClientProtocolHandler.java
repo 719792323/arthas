@@ -58,10 +58,10 @@ public class McpClientProtocolHandler {
     // 会话管理器，用于支持异步命令执行（如 dashboard）
     private final ArthasCommandSessionManager commandSessionManager;
     
-    // 客户端模式下使用固定的 session ID（一个客户端实例对应一个 session）
-    private static final String CLIENT_SESSION_ID = "mcp-client-session";
+    // 客户端 MCP Session ID，由 ArthasMcpClient 生成并传入，与传给管控平台的 sessionId 保持一致
+    private volatile String mcpSessionId;
     
-    private McpHttpClient httpClient;
+    private McpTransport transport;
     
     // 服务端信息（initialize 后获取）
     private volatile McpSchema.Implementation serverInfo;
@@ -70,6 +70,10 @@ public class McpClientProtocolHandler {
     
     // 协议状态
     private volatile boolean initialized = false;
+    
+    // taskId/stageId 任务追踪
+    private final boolean taskStageTrackingEnabled;
+    private final TaskStageTracker taskStageTracker;
 
     public McpClientProtocolHandler(McpClientConfig config, ObjectMapper objectMapper, CommandExecutor commandExecutor) {
         Assert.notNull(config, "config must not be null");
@@ -78,6 +82,15 @@ public class McpClientProtocolHandler {
         this.config = config;
         this.objectMapper = objectMapper;
         this.commandExecutor = commandExecutor;
+        
+        // 初始化 taskId/stageId 追踪
+        this.taskStageTrackingEnabled = config.isTaskStageTrackingEnabled();
+        this.taskStageTracker = taskStageTrackingEnabled ? new TaskStageTracker() : null;
+        if (taskStageTrackingEnabled) {
+            logger.info("taskId/stageId 任务追踪已启用");
+        } else {
+            logger.info("taskId/stageId 任务追踪已禁用");
+        }
         
         // 初始化会话管理器，支持异步命令执行
         if (commandExecutor != null) {
@@ -88,10 +101,28 @@ public class McpClientProtocolHandler {
     }
 
     /**
-     * 设置 HTTP 客户端
+     * 设置 MCP Session ID（由 ArthasMcpClient 生成的 UUID，与传给管控平台的 sessionId 一致）
      */
+    public void setMcpSessionId(String mcpSessionId) {
+        Assert.hasText(mcpSessionId, "mcpSessionId must not be empty");
+        this.mcpSessionId = mcpSessionId;
+        logger.debug("Set mcpSessionId: {}", mcpSessionId);
+    }
+
+    /**
+     * 设置传输层实例
+     */
+    public void setTransport(McpTransport transport) {
+        this.transport = transport;
+    }
+
+    /**
+     * 设置 HTTP 客户端（兼容旧代码，转发到 setTransport）
+     * @deprecated 请使用 {@link #setTransport(McpTransport)}
+     */
+    @Deprecated
     public void setHttpClient(McpHttpClient httpClient) {
-        this.httpClient = httpClient;
+        this.transport = httpClient;
     }
 
     /**
@@ -196,6 +227,10 @@ public class McpClientProtocolHandler {
      */
     private CompletableFuture<Object> handleToolsCall(McpSchema.JSONRPCRequest request) {
         return CompletableFuture.supplyAsync(() -> {
+            String taskId = null;
+            String stageId = null;
+            boolean acquired = false;
+            
             try {
                 McpSchema.CallToolRequest callRequest = objectMapper.convertValue(
                         request.getParams(), McpSchema.CallToolRequest.class);
@@ -204,6 +239,36 @@ public class McpClientProtocolHandler {
                 Map<String, Object> arguments = callRequest.getArguments();
                 
                 logger.debug("Calling tool: name={}, arguments={}", toolName, arguments);
+                
+                // ========== taskId/stageId 解析与校验 ==========
+                if (taskStageTrackingEnabled) {
+                    Map<String, Object> meta = callRequest.meta();
+                    if (meta == null || !meta.containsKey("taskId") || !meta.containsKey("stageId")) {
+                        logger.warn("缺少 taskId 或 stageId，拒绝执行工具: {}", toolName);
+                        return McpSchema.CallToolResult.builder()
+                                .addTextContent("Error: Missing required taskId or stageId in _meta field")
+                                .isError(true)
+                                .build();
+                    }
+                    taskId = String.valueOf(meta.get("taskId"));
+                    stageId = String.valueOf(meta.get("stageId"));
+                    logger.debug("解析到 taskId={}, stageId={}", taskId, stageId);
+                    
+                    // ========== 重复任务防护 ==========
+                    if (!taskStageTracker.tryAcquire(taskId, stageId)) {
+                        logger.warn("任务阶段已在执行中，拒绝重复执行: taskId={}, stageId={}, tool={}", 
+                                taskId, stageId, toolName);
+                        Map<String, Object> errorMeta = new HashMap<>();
+                        errorMeta.put("taskId", taskId);
+                        errorMeta.put("stageId", stageId);
+                        return McpSchema.CallToolResult.builder()
+                                .addTextContent("Error: Stage is already executing, taskId=" + taskId + ", stageId=" + stageId)
+                                .isError(true)
+                                .meta(errorMeta)
+                                .build();
+                    }
+                    acquired = true;
+                }
                 
                 ToolCallback callback = toolCallbacks.get(toolName);
                 if (callback == null) {
@@ -227,8 +292,19 @@ public class McpClientProtocolHandler {
                 // 添加 ArthasCommandContext，这是执行 Arthas 命令的关键
                 // 使用带会话支持的构造函数，支持 dashboard 等异步命令
                 if (commandSessionManager != null) {
+                    /**
+                     * class ArthasCommandSessionManager.CommandSessionBinding {
+                     *         private final String mcpSessionId;
+                     *         private final String arthasSessionId;
+                     *         private final String consumerId;
+                     *         private final long createdTime;
+                     *         private volatile long lastAccessTime;
+                     * }
+                     */
+                    // 使用实际的 mcpSessionId（由 ArthasMcpClient 生成），与传给管控平台的 sessionId 一致
+                    String sessionId = mcpSessionId != null ? mcpSessionId : "mcp-client-session-fallback";
                     ArthasCommandSessionManager.CommandSessionBinding binding = 
-                            commandSessionManager.getCommandSession(CLIENT_SESSION_ID, null);
+                            commandSessionManager.getCommandSession(sessionId, null);
                     ArthasCommandContext commandContext = new ArthasCommandContext(commandExecutor, binding);
                     contextMap.put(TOOL_CONTEXT_COMMAND_CONTEXT_KEY, commandContext);
                     logger.debug("Created command context with session support: arthasSessionId={}", 
@@ -247,18 +323,36 @@ public class McpClientProtocolHandler {
                 // 执行工具
                 String result = callback.call(toolInput, toolContext);
                 
-                // 构建响应
-                return McpSchema.CallToolResult.builder()
+                // 构建响应，如果启用了 taskId/stageId 追踪，则在 _meta 中附带
+                McpSchema.CallToolResult.Builder resultBuilder = McpSchema.CallToolResult.builder()
                         .addTextContent(result != null ? result : "")
-                        .isError(false)
-                        .build();
+                        .isError(false);
+                if (taskStageTrackingEnabled && taskId != null && stageId != null) {
+                    Map<String, Object> resultMeta = new HashMap<>();
+                    resultMeta.put("taskId", taskId);
+                    resultMeta.put("stageId", stageId);
+                    resultBuilder.meta(resultMeta);
+                }
+                return resultBuilder.build();
                 
             } catch (Exception e) {
                 logger.error("Tool execution failed", e);
-                return McpSchema.CallToolResult.builder()
+                // 构建错误响应，如果启用了 taskId/stageId 追踪，则在 _meta 中附带
+                McpSchema.CallToolResult.Builder errorBuilder = McpSchema.CallToolResult.builder()
                         .addTextContent("Error: " + e.getMessage())
-                        .isError(true)
-                        .build();
+                        .isError(true);
+                if (taskStageTrackingEnabled && taskId != null && stageId != null) {
+                    Map<String, Object> errorMeta = new HashMap<>();
+                    errorMeta.put("taskId", taskId);
+                    errorMeta.put("stageId", stageId);
+                    errorBuilder.meta(errorMeta);
+                }
+                return errorBuilder.build();
+            } finally {
+                // 确保无论成功或异常都清除执行中状态
+                if (taskStageTrackingEnabled && acquired && taskId != null && stageId != null) {
+                    taskStageTracker.release(taskId, stageId);
+                }
             }
         });
     }
@@ -285,8 +379,8 @@ public class McpClientProtocolHandler {
      * 发送 initialize 请求
      */
     public CompletableFuture<McpSchema.InitializeResult> sendInitialize() {
-        if (httpClient == null) {
-            return failedFuture(new IllegalStateException("HTTP client not set"));
+        if (transport == null) {
+            return failedFuture(new IllegalStateException("Transport not set"));
         }
         
         // 构建客户端能力
@@ -310,13 +404,13 @@ public class McpClientProtocolHandler {
         McpSchema.JSONRPCRequest request = new McpSchema.JSONRPCRequest(
                 McpSchema.JSONRPC_VERSION,
                 McpSchema.METHOD_INITIALIZE,
-                httpClient.nextRequestId(),
+                transport.nextRequestId(),
                 params
         );
         
         logger.info("Sending initialize request...");
         
-        return httpClient.sendRequest(request)
+        return transport.sendRequest(request)
                 .thenApply(response -> {
                     if (response.getError() != null) {
                         throw new RuntimeException("Initialize failed: " + response.getError().getMessage());
@@ -343,8 +437,8 @@ public class McpClientProtocolHandler {
      * 发送 initialized 通知
      */
     public CompletableFuture<Void> sendInitialized() {
-        if (httpClient == null) {
-            return failedFuture(new IllegalStateException("HTTP client not set"));
+        if (transport == null) {
+            return failedFuture(new IllegalStateException("Transport not set"));
         }
         
         McpSchema.JSONRPCNotification notification = new McpSchema.JSONRPCNotification(
@@ -353,7 +447,7 @@ public class McpClientProtocolHandler {
                 null
         );
         
-        return httpClient.sendNotification(notification)
+        return transport.sendNotification(notification)
                 .thenRun(() -> {
                     initialized = true;
                     logger.info("Sent initialized notification");
@@ -364,18 +458,18 @@ public class McpClientProtocolHandler {
      * 发送 ping 请求
      */
     public CompletableFuture<Void> sendPing() {
-        if (httpClient == null) {
-            return failedFuture(new IllegalStateException("HTTP client not set"));
+        if (transport == null) {
+            return failedFuture(new IllegalStateException("Transport not set"));
         }
         
         McpSchema.JSONRPCRequest request = new McpSchema.JSONRPCRequest(
                 McpSchema.JSONRPC_VERSION,
                 McpSchema.METHOD_PING,
-                httpClient.nextRequestId(),
+                transport.nextRequestId(),
                 null
         );
         
-        return httpClient.sendRequest(request)
+        return transport.sendRequest(request)
                 .thenAccept(response -> {
                     if (response.getError() != null) {
                         logger.warn("Ping failed: {}", response.getError().getMessage());
@@ -396,7 +490,7 @@ public class McpClientProtocolHandler {
                 null
         );
         
-        httpClient.sendResponse(response)
+        transport.sendResponse(response)
                 .exceptionally(ex -> {
                     logger.error("Failed to send response", ex);
                     return null;
@@ -417,7 +511,7 @@ public class McpClientProtocolHandler {
                 error
         );
         
-        httpClient.sendResponse(response)
+        transport.sendResponse(response)
                 .exceptionally(ex -> {
                     logger.error("Failed to send error response", ex);
                     return null;
@@ -468,10 +562,15 @@ public class McpClientProtocolHandler {
         serverCapabilities = null;
         negotiatedProtocolVersion = null;
         
+        // 清除所有 taskId/stageId 追踪状态
+        if (taskStageTracker != null) {
+            taskStageTracker.releaseAll();
+        }
+        
         // 清理会话（重连时会创建新的会话）
-        if (commandSessionManager != null) {
-            commandSessionManager.closeCommandSession(CLIENT_SESSION_ID);
-            logger.debug("Closed command session on reset");
+        if (commandSessionManager != null && mcpSessionId != null) {
+            commandSessionManager.closeCommandSession(mcpSessionId);
+            logger.debug("Closed command session on reset, mcpSessionId: {}", mcpSessionId);
         }
     }
 

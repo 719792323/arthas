@@ -12,8 +12,9 @@ import com.taobao.arthas.mcp.server.util.Assert;
  * 支持通过环境变量配置反向连接参数，用于 HTTP/SSE 模式
  * 
  * 环境变量说明：
- * - ARTHAS_MCP_CLIENT_SERVER_URL: 管控平台 HTTP 地址，如 http://localhost:8080/mcp
+ * - ARTHAS_MCP_CLIENT_SERVER_URL: 管控平台地址，如 http://localhost:8080/mcp 或 ws://localhost:8080/mcp
  * - ARTHAS_MCP_CLIENT_AUTH_TOKEN: 认证 Token
+ * - ARTHAS_MCP_CLIENT_TRANSPORT_TYPE: 传输类型，WEBSOCKET 或 HTTP_SSE（默认 WEBSOCKET）
  * - ARTHAS_MCP_CLIENT_RECONNECT_ENABLED: 是否启用自动重连（默认 true）
  * - ARTHAS_MCP_CLIENT_RECONNECT_INITIAL_DELAY: 重连初始延迟毫秒（默认 5000）
  * - ARTHAS_MCP_CLIENT_RECONNECT_MAX_DELAY: 重连最大延迟毫秒（默认 300000）
@@ -26,14 +27,26 @@ import com.taobao.arthas.mcp.server.util.Assert;
  * - ARTHAS_MCP_CLIENT_SSE_RECONNECT_DELAY: SSE 重连延迟毫秒（默认 3000）
  * - ARTHAS_MCP_CLIENT_CLIENT_NAME: 客户端名称（默认 arthas-mcp-client）
  * - ARTHAS_MCP_CLIENT_CLIENT_VERSION: 客户端版本（默认 4.1.5）
+ * - ARTHAS_MCP_CLIENT_TASK_STAGE_TRACKING_ENABLED: 是否启用 taskId/stageId 任务追踪（默认 true）
  *
  * @author Arthas Team
  */
 public class McpClientConfig {
 
+    /**
+     * 传输类型枚举
+     */
+    public enum TransportType {
+        /** WebSocket 双向全双工通信 */
+        WEBSOCKET,
+        /** HTTP/SSE 双通道模式 */
+        HTTP_SSE
+    }
+
     // ========== 环境变量名 ==========
     public static final String ENV_SERVER_URL = "ARTHAS_MCP_CLIENT_SERVER_URL";
     public static final String ENV_AUTH_TOKEN = "ARTHAS_MCP_CLIENT_AUTH_TOKEN";
+    public static final String ENV_TRANSPORT_TYPE = "ARTHAS_MCP_CLIENT_TRANSPORT_TYPE";
     public static final String ENV_RECONNECT_ENABLED = "ARTHAS_MCP_CLIENT_RECONNECT_ENABLED";
     public static final String ENV_RECONNECT_INITIAL_DELAY = "ARTHAS_MCP_CLIENT_RECONNECT_INITIAL_DELAY";
     public static final String ENV_RECONNECT_MAX_DELAY = "ARTHAS_MCP_CLIENT_RECONNECT_MAX_DELAY";
@@ -46,6 +59,7 @@ public class McpClientConfig {
     public static final String ENV_SSE_RECONNECT_DELAY = "ARTHAS_MCP_CLIENT_SSE_RECONNECT_DELAY";
     public static final String ENV_CLIENT_NAME = "ARTHAS_MCP_CLIENT_CLIENT_NAME";
     public static final String ENV_CLIENT_VERSION = "ARTHAS_MCP_CLIENT_CLIENT_VERSION";
+    public static final String ENV_TASK_STAGE_TRACKING_ENABLED = "ARTHAS_MCP_CLIENT_TASK_STAGE_TRACKING_ENABLED";
 
     // ========== 默认值 ==========
     private static final String DEFAULT_CLIENT_NAME = "arthas-mcp-client";
@@ -57,6 +71,7 @@ public class McpClientConfig {
     // ========== 配置字段 ==========
     private String serverUrl;
     private String authToken;
+    private TransportType transportType = TransportType.WEBSOCKET;
     private ReconnectConfig reconnect = new ReconnectConfig();
     private HeartbeatConfig heartbeat = new HeartbeatConfig();
     private long connectTimeout = DEFAULT_CONNECT_TIMEOUT;
@@ -64,6 +79,7 @@ public class McpClientConfig {
     private long sseReconnectDelay = DEFAULT_SSE_RECONNECT_DELAY;
     private String clientName = DEFAULT_CLIENT_NAME;
     private String clientVersion = DEFAULT_CLIENT_VERSION;
+    private boolean taskStageTrackingEnabled = true;
 
     /**
      * 重连配置
@@ -243,6 +259,22 @@ public class McpClientConfig {
             config.setClientVersion(clientVersion);
         }
         
+        // 传输类型
+        String transportType = getEnv(ENV_TRANSPORT_TYPE);
+        if (transportType != null && !transportType.isEmpty()) {
+            try {
+                config.setTransportType(TransportType.valueOf(transportType.toUpperCase()));
+            } catch (IllegalArgumentException e) {
+                // 忽略无效值，使用默认 WEBSOCKET
+            }
+        }
+        
+        // taskId/stageId 任务追踪开关
+        String taskStageTrackingEnabled = getEnv(ENV_TASK_STAGE_TRACKING_ENABLED);
+        if (taskStageTrackingEnabled != null && !taskStageTrackingEnabled.isEmpty()) {
+            config.setTaskStageTrackingEnabled(Boolean.parseBoolean(taskStageTrackingEnabled));
+        }
+        
         return config;
     }
 
@@ -256,9 +288,15 @@ public class McpClientConfig {
     public void validate() {
         Assert.hasText(serverUrl, "serverUrl must not be empty");
         
-        // 验证 URL 格式
-        if (!serverUrl.startsWith("http://") && !serverUrl.startsWith("https://")) {
-            throw new IllegalArgumentException("serverUrl must start with http:// or https://");
+        // 根据 URL scheme 自动推断传输类型
+        if (serverUrl.startsWith("ws://") || serverUrl.startsWith("wss://")) {
+            transportType = TransportType.WEBSOCKET;
+        } else if (serverUrl.startsWith("http://") || serverUrl.startsWith("https://")) {
+            // 有效的 HTTP URL
+            // 如果传输类型是 WEBSOCKET，URL 会在 McpWebSocketClient 中自动转换 scheme
+        } else {
+            throw new IllegalArgumentException(
+                    "serverUrl must start with http://, https://, ws:// or wss://");
         }
     }
 
@@ -285,6 +323,14 @@ public class McpClientConfig {
 
     public void setAuthToken(String authToken) {
         this.authToken = authToken;
+    }
+
+    public TransportType getTransportType() {
+        return transportType;
+    }
+
+    public void setTransportType(TransportType transportType) {
+        this.transportType = transportType;
     }
 
     public ReconnectConfig getReconnect() {
@@ -343,11 +389,20 @@ public class McpClientConfig {
         this.clientVersion = clientVersion;
     }
 
+    public boolean isTaskStageTrackingEnabled() {
+        return taskStageTrackingEnabled;
+    }
+
+    public void setTaskStageTrackingEnabled(boolean taskStageTrackingEnabled) {
+        this.taskStageTrackingEnabled = taskStageTrackingEnabled;
+    }
+
     @Override
     public String toString() {
         return "McpClientConfig{" +
                 "serverUrl='" + serverUrl + '\'' +
                 ", authToken='" + (authToken != null ? "***" : "null") + '\'' +
+                ", transportType=" + transportType +
                 ", reconnect=" + reconnect +
                 ", heartbeat=" + heartbeat +
                 ", connectTimeout=" + connectTimeout +
@@ -355,6 +410,7 @@ public class McpClientConfig {
                 ", sseReconnectDelay=" + sseReconnectDelay +
                 ", clientName='" + clientName + '\'' +
                 ", clientVersion='" + clientVersion + '\'' +
+                ", taskStageTrackingEnabled=" + taskStageTrackingEnabled +
                 '}';
     }
 
@@ -435,6 +491,16 @@ public class McpClientConfig {
 
         public Builder clientVersion(String version) {
             config.setClientVersion(version);
+            return this;
+        }
+
+        public Builder transportType(TransportType type) {
+            config.setTransportType(type);
+            return this;
+        }
+
+        public Builder taskStageTrackingEnabled(boolean enabled) {
+            config.setTaskStageTrackingEnabled(enabled);
             return this;
         }
 

@@ -267,7 +267,9 @@ public class VmToolCommand extends AnnotatedCommand {
                         process.end();
                     } else {
                         String result = vmToolInstance().referenceAnalyze(matchedClasses.get(0), objectNum, backtraceNum);
+                        // 同时使用 write 和 appendResult，以便 TTY 和 MCP 都能获取结果
                         process.write(result);
+                        process.appendResult(new VmToolModel().setHeapAnalyzeResult(result));
                         process.end();
                     }
                 }

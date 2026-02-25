@@ -13,6 +13,7 @@
 core/src/main/resources/com/taobao/arthas/core/res/version
 tunnel-server/src/main/resources/static
 **/*.orig
+.codebuddy/
 
 site/src/site/sphinx/_build
 site/src/site/sphinx/en/_build
@@ -31,3 +32,8 @@ pom.xml.versionsBackup
 
 # integration-test (python/expect)
 integration-test/telnet-stop-leak/work*/
+
+arthas-mcp-server/py/ui/dist/
+arthas-mcp-server/py/ui/node_modules/
+
+arthas-output
