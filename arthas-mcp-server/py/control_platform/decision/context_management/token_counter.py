@@ -23,7 +23,7 @@ class TokenCounter:
     提供基于 tiktoken 的 token 计数能力，支持：
     - 按模型名自动选择编码器，不支持时 fallback 到 cl100k_base
     - 单条消息计数、消息列表计数、纯文本计数
-    - 预算计算（available_budget = context_max_tokens - context_reserved_tokens）
+    - 预算计算（available_budget = context_max_tokens - system_prompt_tokens - llm_max_tokens）
     """
 
     # 每条消息的固定 token 开销（role + 分隔符等），参照 OpenAI 的计算方式
@@ -122,16 +122,26 @@ class TokenCounter:
         total += self._REPLY_OVERHEAD  # 对话尾部开销
         return total
 
-    def get_available_budget(self) -> int:
+    def get_available_budget(self, system_prompt_tokens: Optional[int] = None) -> int:
         """
         计算可用 token 预算
 
-        available_budget = context_max_tokens - context_reserved_tokens
+        当传入 system_prompt_tokens 时（动态计算模式）：
+            available_budget = context_max_tokens - system_prompt_tokens - llm_max_tokens
+        当未传入时（静态降级模式）：
+            available_budget = context_max_tokens - context_reserved_tokens
+
+        Args:
+            system_prompt_tokens: 动态计算的 system prompt 实际 token 数。
+                为 None 时使用静态 context_reserved_tokens 作为降级默认值。
 
         Returns:
             可用 token 预算
         """
-        budget = settings.context_max_tokens - settings.context_reserved_tokens
+        if system_prompt_tokens is not None:
+            budget = settings.context_max_tokens - system_prompt_tokens - settings.llm_max_tokens
+        else:
+            budget = settings.context_max_tokens - settings.context_reserved_tokens
         return max(budget, 0)
 
     def is_over_budget(self, messages: List[Dict[str, Any]]) -> bool:

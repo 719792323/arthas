@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 from control_platform.db.models import DiagnosisStage, StageStatus, StageType
 from control_platform.db.repository import DiagnosisRepository
 from control_platform.decision.context import DecisionContext
+from control_platform.rag.provider import RAGProvider
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +34,11 @@ class ContextBuilder:
     - LLM_CONCLUSION → role: "assistant"（conclusion）
     """
 
-    def __init__(self):
+    def __init__(self, rag_provider: Optional[RAGProvider] = None):
         # 按 session_id 索引的工具列表，每个客户端可能有不同的工具集
         self._tools_by_session: Dict[str, List[Dict[str, Any]]] = {}
+        # RAG Provider 实例（可选）
+        self._rag_provider = rag_provider
 
     def set_available_tools(self, session_id: str, tools: List[Dict[str, Any]]) -> None:
         """设置指定 session 的可用工具列表"""
@@ -82,20 +85,40 @@ class ContextBuilder:
         session_id = task.session_id if task else ""
         available_tools = self.get_available_tools(session_id)
 
-        # 5. 构建 DecisionContext
+        # 5. RAG 知识检索（如果 RAGProvider 可用）
+        rag_context = None
+        user_query = task.user_query if task else ""
+        if self._rag_provider and user_query:
+            rag_result = self._rag_provider.retrieve(user_query)
+            if rag_result and rag_result.results:
+                rag_context = {
+                    "results": [
+                        {
+                            "document": r.document,
+                            "score": r.score,
+                            "metadata": r.metadata,
+                            "id": r.id,
+                        }
+                        for r in rag_result.results
+                    ],
+                    "total_tokens": rag_result.total_tokens,
+                }
+
+        # 6. 构建 DecisionContext
         context = DecisionContext(
             task_id=task_id,
             session_id=session_id,
-            user_query=task.user_query if task else "",
+            user_query=user_query,
             messages=messages,
             available_tools=available_tools,
             current_stage_seq=task.current_stage_seq if task else 0,
-            rag_context=None,  # 预留 RAG 上下文
+            rag_context=rag_context,
         )
 
         logger.debug(
             f"构建上下文完成: task_id={task_id}, "
-            f"messages={len(messages)}, tools={len(available_tools)}"
+            f"messages={len(messages)}, tools={len(available_tools)}, "
+            f"rag={'有' if rag_context else '无'}"
         )
         return context
 

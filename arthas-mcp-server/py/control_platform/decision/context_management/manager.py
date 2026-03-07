@@ -84,14 +84,44 @@ class ContextWindowManager:
         countable_messages = [m for m in messages if m.get("role") != "function_call"]
         original_tokens = self._token_counter.count_messages(countable_messages)
         original_count = len(messages)
-        available_budget = self._token_counter.get_available_budget()
+
+        # 动态计算 system prompt 实际 token 数，用于精确预算分配
+        system_prompt_tokens = None
+        try:
+            # 延迟导入，避免与 openai_engine 的循环依赖
+            from control_platform.decision.openai_engine import build_system_prompt
+
+            system_prompt_text = build_system_prompt(
+                context.available_tools,
+                context.rag_context,
+            )
+            system_prompt_tokens = self._token_counter.count_text(system_prompt_text)
+            logger.debug(
+                "动态计算 system prompt tokens: %d (task_id=%s)",
+                system_prompt_tokens,
+                context.task_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "动态计算 system prompt tokens 失败，降级到静态 context_reserved_tokens: "
+                "task_id=%s, error=%s",
+                context.task_id,
+                str(e),
+            )
+            # system_prompt_tokens 保持 None，get_available_budget 将使用静态降级值
+
+        available_budget = self._token_counter.get_available_budget(
+            system_prompt_tokens=system_prompt_tokens
+        )
 
         logger.info(
-            "上下文优化开始: task_id=%s, 消息=%d 条, tokens=%d, 预算=%d",
+            "上下文优化开始: task_id=%s, 消息=%d 条, tokens=%d, 预算=%d "
+            "(system_prompt_tokens=%s)",
             context.task_id,
             original_count,
             original_tokens,
             available_budget,
+            system_prompt_tokens if system_prompt_tokens is not None else "static_fallback",
         )
 
         # 是否超预算？

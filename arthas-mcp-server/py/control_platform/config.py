@@ -85,8 +85,8 @@ class Settings(BaseSettings):
     # ========== 上下文管理配置 ==========
     # 输入上下文 token 预算上限（应大于 context_reserved_tokens，否则可用预算为 0）
     context_max_tokens: int = Field(default=128000, description="输入上下文 token 预算上限")
-    # system prompt + tools schema 预留开销
-    context_reserved_tokens: int = Field(default=8192, description="system prompt + tools schema 预留 token 开销")
+    # system prompt + tools schema 预留开销（动态计算失败时的降级默认值）
+    context_reserved_tokens: int = Field(default=8192, description="system prompt 预留 token，动态计算失败时的降级默认值")
     # 单条工具结果触发摘要的 token 阈值
     tool_result_summary_threshold: int = Field(default=4096, description="单条工具结果触发摘要的 token 阈值")
     # 滑动窗口保留的最近消息数
@@ -97,6 +97,46 @@ class Settings(BaseSettings):
     summary_timeout: float = Field(default=60.0, description="LLM 摘要调用超时（秒）")
     # 是否启用工具结果即时摘要
     enable_tool_result_summary: bool = Field(default=True, description="是否启用工具结果即时摘要")
+
+    # ========== RAG 配置 ==========
+    # 是否启用 RAG 知识检索增强
+    rag_enabled: bool = Field(default=True, description="是否启用 RAG 知识检索增强")
+    # 知识库文档目录路径
+    rag_knowledge_dir: str = Field(default="knowledge/", description="知识库文档目录路径")
+    # 向量数据库类型（chroma / qdrant / milvus 等）
+    rag_store_type: str = Field(default="chroma", description="向量数据库类型")
+    # 向量数据库本地持久化路径
+    rag_store_path: str = Field(default="data/vector_db/", description="向量数据库本地持久化路径")
+    # 向量数据库远程地址（仅远程模式时使用）
+    rag_store_url: str = Field(default="", description="向量数据库远程地址，仅远程模式时使用")
+    # 检索返回的最大知识片段数
+    rag_top_k: int = Field(default=3, description="检索返回的最大知识片段数")
+    # 相似度过滤阈值（低于此值的结果将被丢弃），混合检索启用时仅对纯向量路径生效
+    rag_similarity_threshold: float = Field(default=0.5, description="相似度过滤阈值")
+    # RAG 知识的 token 预算上限
+    rag_max_tokens: int = Field(default=2048, description="RAG 知识的 token 预算上限")
+    # Embedding 提供者类型：local（本地 sentence-transformers）或 api（OpenAI 兼容 API）
+    rag_embedding_provider: str = Field(default="local", description="Embedding 提供者: local 或 api")
+    # Embedding 模型名称（local 模式默认 BAAI/bge-m3，api 模式默认 text-embedding-3-small）
+    rag_embedding_model: str = Field(default="BAAI/bge-m3", description="Embedding 模型名称")
+    # Parent chunk 动态边界算法的 token 上限
+    rag_max_parent_size: int = Field(default=2048, description="Parent chunk 动态边界的 token 上限")
+    # 是否启用混合检索（BM25 + 向量融合），设为 False 时退化为纯向量检索
+    rag_hybrid_search_enabled: bool = Field(default=True, description="是否启用 BM25 + 向量混合检索")
+    # RRF 融合分数过滤阈值，低于此值的结果将被丢弃（仅混合检索时生效）
+    rag_rrf_score_threshold: float = Field(default=0.01, description="RRF 融合分数过滤阈值")
+
+    # ========== 分布式锁配置 ==========
+    # 锁实现类型：local（本地 asyncio 锁）或 redis（Redis 分布式锁）
+    lock_type: str = Field(default="local", description="锁实现类型: local 或 redis")
+    # Redis 连接 URL（仅 lock_type=redis 时使用）
+    redis_url: str = Field(default="redis://localhost:6379/0", description="Redis 连接 URL")
+    # 锁的 TTL 秒数
+    lock_ttl: int = Field(default=300, description="锁的 TTL 秒数，默认 300（5 分钟）")
+    # 锁键前缀，用于 Redis 键命名空间隔离
+    lock_key_prefix: str = Field(default="arthas:lock:", description="Redis 锁键前缀")
+    # 是否启用看门狗自动续期机制
+    lock_watchdog_enabled: bool = Field(default=True, description="是否启用看门狗自动续期机制")
 
     # ========== 调试配置 ==========
     # 是否启用调试模式
@@ -130,6 +170,14 @@ class Settings(BaseSettings):
     def validate_sliding_window_keep_recent(cls, v: int) -> int:
         if v < 2:
             raise ValueError("sliding_window_keep_recent 至少为 2")
+        return v
+
+    @field_validator("lock_type")
+    @classmethod
+    def validate_lock_type(cls, v: str) -> str:
+        allowed = ["local", "redis"]
+        if v not in allowed:
+            raise ValueError(f"lock_type 必须为 {allowed} 之一，当前值: {v}")
         return v
 
     @field_validator("summary_timeout")

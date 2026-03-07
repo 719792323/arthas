@@ -53,24 +53,14 @@ class LocalTaskLock(TaskLock):
         """
         lock = await self._get_or_create_lock(task_id)
 
-        # 非阻塞尝试获取锁
-        acquired = lock.locked()
-        if acquired:
-            # 锁已被占用
-            logger.debug(f"🔒 锁已被占用: task_id={task_id}")
-            return False
-
-        # 尝试获取
+        # 非阻塞尝试获取锁：直接用 wait_for + 极短超时，避免 check-then-act 竞态条件
         try:
-            # 使用非阻塞方式：先检查再获取
-            # asyncio.Lock 没有 try_lock，但我们已经检查了 locked()
-            # 在协程切换间可能有竞态，所以用 wait_for + 极短超时
             await asyncio.wait_for(lock.acquire(), timeout=0.01)
             self._lock_times[task_id] = time.time()
             logger.debug(f"🔓 获取锁成功: task_id={task_id}")
             return True
         except asyncio.TimeoutError:
-            logger.debug(f"🔒 锁获取超时（已被占用）: task_id={task_id}")
+            logger.debug(f"🔒 锁已被占用: task_id={task_id}")
             return False
 
     async def release(self, task_id: str) -> None:

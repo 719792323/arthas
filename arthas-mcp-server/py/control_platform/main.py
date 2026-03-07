@@ -29,9 +29,10 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Header, HTTP
 from pydantic import BaseModel
 
 from control_platform.config import settings
-from control_platform.db.database import init_db, close_db
+from control_platform.db.database import init_db, close_db, shared_session
 from control_platform.db.models import StageStatus, StageType
 from control_platform.db.repository import DiagnosisRepository
+from control_platform.decision.context import DecisionContext
 from control_platform.decision.context_builder import ContextBuilder
 from control_platform.decision.noop_engine import MockDecisionEngine
 from control_platform.decision.openai_engine import OpenAIDecisionEngine, build_system_prompt
@@ -45,8 +46,8 @@ from control_platform.event.handler import (
 )
 from control_platform.event.scheduler import EventScheduler
 from control_platform.executor.task_pool import TaskPool
-from control_platform.lock.base import TaskLockNotAcquired
-from control_platform.lock.local_lock import LocalTaskLock
+from control_platform.lock.base import TaskLock, TaskLockNotAcquired
+from control_platform.lock.factory import create_task_lock
 from control_platform.models.event import (
     DiagnosisProgressSchema,
     DiagnosisStageSchema,
@@ -71,7 +72,7 @@ logger = logging.getLogger("control_platform")
 # ========== 全局组件 ==========
 mcp_handler: Optional[McpHandler] = None
 session_manager: Optional[SessionManager] = None
-task_lock: Optional[LocalTaskLock] = None
+task_lock: Optional[TaskLock] = None
 task_pool: Optional[TaskPool] = None
 event_scheduler: Optional[EventScheduler] = None
 handler_registry: Optional[StageHandlerRegistry] = None
@@ -111,9 +112,9 @@ async def lifespan(app: FastAPI):
     # 4. 初始化会话管理器
     session_manager = SessionManager(mcp_handler)
 
-    # 5. 初始化任务锁
+    # 5. 初始化任务锁（根据配置自动选择本地锁或 Redis 分布式锁）
     # 注意：context_builder 的 on_unregister 回调在步骤 7 创建后注册
-    task_lock = LocalTaskLock(ttl=300.0)
+    task_lock = create_task_lock(settings)
 
     # 6. 初始化执行池（占位，handler_registry 尚未初始化，后续注入）
     task_pool = TaskPool(
@@ -206,6 +207,9 @@ async def lifespan(app: FastAPI):
     event_scheduler.stop()
     await task_pool.shutdown()
     await session_manager.close_all()
+    # 释放锁资源（Redis 连接池等）
+    if hasattr(task_lock, 'close'):
+        await task_lock.close()
     await close_db()
     logger.info("管控平台已关闭")
 
@@ -277,74 +281,76 @@ async def _handle_tool_call_response(
     next_stage = None
     try:
         async with task_lock.locked(task_id):
-            # 1. 从数据库查 stage
-            stage = await diagnosis_repo.get_stage_by_task_and_seq(task_id, stage_seq)
-            if stage is None:
-                logger.warning(
-                    f"未找到对应的 stage: task_id={task_id}, stage_seq={stage_seq}"
+            # shared_session 保证锁内所有数据库操作在同一事务中
+            async with shared_session():
+                # 1. 从数据库查 stage
+                stage = await diagnosis_repo.get_stage_by_task_and_seq(task_id, stage_seq)
+                if stage is None:
+                    logger.warning(
+                        f"未找到对应的 stage: task_id={task_id}, stage_seq={stage_seq}"
+                    )
+                    return
+
+                stage_id = stage.id
+                tool_name = stage.tool_name or ""
+                tool_arguments = stage.tool_arguments or {}
+
+                # 2. 检查 stage 状态，如果已经不是 PENDING 则跳过（幂等保护）
+                if stage.status != StageStatus.PENDING.value:
+                    logger.info(
+                        f"stage 已被处理，跳过: task_id={task_id}, stage_seq={stage_seq}, "
+                        f"status={stage.status}"
+                    )
+                    return
+
+                # 3. 检查响应是否有错误
+                if "error" in response:
+                    error_info = response["error"]
+                    error_msg = f"工具调用返回错误: {error_info.get('message', str(error_info))}"
+                    logger.warning(error_msg)
+                    is_final = await diagnosis_repo.mark_failed(stage_id, error_msg)
+                    if is_final:
+                        await diagnosis_repo.fail_task(task_id)
+                    return
+
+                # 4. 提取工具执行结果
+                result = response.get("result", {})
+                tool_result_text = ToolCallHandler.extract_tool_result(result)
+
+                # 4.1 过滤 Java 端 TaskStageTracker 的重复执行错误
+                #     当调度器重发 TOOL_CALL 请求时，Java 端幂等保护会返回
+                #     "Error: Stage is already executing" 错误（isError=true）。
+                #     这不是真正的工具执行失败，应忽略此响应，等待真正的执行结果。
+                is_error = result.get("isError", False)
+                if is_error and "Stage is already executing" in tool_result_text:
+                    logger.info(
+                        f"忽略重复执行错误响应: task_id={task_id}, "
+                        f"stage_seq={stage_seq}"
+                    )
+                    return
+
+                # 5. 完成 TOOL_CALL stage，创建 TOOL_RESULT stage
+                next_stage = await diagnosis_repo.complete_and_next(
+                    stage_id=stage_id,
+                    output_data={
+                        "tool_name": tool_name,
+                        "tool_arguments": tool_arguments,
+                        "tool_result": tool_result_text,
+                        "raw_response": result,
+                    },
+                    next_stage_type=StageType.TOOL_RESULT.value,
+                    next_input_data={
+                        "tool_name": tool_name,
+                        "tool_arguments": tool_arguments,
+                        "tool_result": tool_result_text,
+                    },
+                    tool_result=tool_result_text,
                 )
-                return
 
-            stage_id = stage.id
-            tool_name = stage.tool_name or ""
-            tool_arguments = stage.tool_arguments or {}
-
-            # 2. 检查 stage 状态，如果已经不是 PENDING 则跳过（幂等保护）
-            if stage.status != StageStatus.PENDING.value:
                 logger.info(
-                    f"stage 已被处理，跳过: task_id={task_id}, stage_seq={stage_seq}, "
-                    f"status={stage.status}"
+                    f"工具调用完成，已创建 TOOL_RESULT stage: task_id={task_id}, "
+                    f"tool={tool_name}, result_length={len(tool_result_text)}"
                 )
-                return
-
-            # 3. 检查响应是否有错误
-            if "error" in response:
-                error_info = response["error"]
-                error_msg = f"工具调用返回错误: {error_info.get('message', str(error_info))}"
-                logger.warning(error_msg)
-                is_final = await diagnosis_repo.mark_failed(stage_id, error_msg)
-                if is_final:
-                    await diagnosis_repo.fail_task(task_id)
-                return
-
-            # 4. 提取工具执行结果
-            result = response.get("result", {})
-            tool_result_text = ToolCallHandler.extract_tool_result(result)
-
-            # 4.1 过滤 Java 端 TaskStageTracker 的重复执行错误
-            #     当调度器重发 TOOL_CALL 请求时，Java 端幂等保护会返回
-            #     "Error: Stage is already executing" 错误（isError=true）。
-            #     这不是真正的工具执行失败，应忽略此响应，等待真正的执行结果。
-            is_error = result.get("isError", False)
-            if is_error and "Stage is already executing" in tool_result_text:
-                logger.info(
-                    f"忽略重复执行错误响应: task_id={task_id}, "
-                    f"stage_seq={stage_seq}"
-                )
-                return
-
-            # 5. 完成 TOOL_CALL stage，创建 TOOL_RESULT stage
-            next_stage = await diagnosis_repo.complete_and_next(
-                stage_id=stage_id,
-                output_data={
-                    "tool_name": tool_name,
-                    "tool_arguments": tool_arguments,
-                    "tool_result": tool_result_text,
-                    "raw_response": result,
-                },
-                next_stage_type=StageType.TOOL_RESULT.value,
-                next_input_data={
-                    "tool_name": tool_name,
-                    "tool_arguments": tool_arguments,
-                    "tool_result": tool_result_text,
-                },
-                tool_result=tool_result_text,
-            )
-
-            logger.info(
-                f"工具调用完成，已创建 TOOL_RESULT stage: task_id={task_id}, "
-                f"tool={tool_name}, result_length={len(tool_result_text)}"
-            )
 
     except TaskLockNotAcquired:
         logger.info(
@@ -367,11 +373,12 @@ async def _handle_tool_call_response(
         try:
             # 兜底标记失败，需要在锁保护下操作
             async with task_lock.locked(task_id):
-                stage = await diagnosis_repo.get_stage_by_task_and_seq(task_id, stage_seq)
-                if stage and stage.status == StageStatus.PENDING.value:
-                    is_final = await diagnosis_repo.mark_failed(stage.id, str(e))
-                    if is_final:
-                        await diagnosis_repo.fail_task(task_id)
+                async with shared_session():
+                    stage = await diagnosis_repo.get_stage_by_task_and_seq(task_id, stage_seq)
+                    if stage and stage.status == StageStatus.PENDING.value:
+                        is_final = await diagnosis_repo.mark_failed(stage.id, str(e))
+                        if is_final:
+                            await diagnosis_repo.fail_task(task_id)
         except TaskLockNotAcquired:
             logger.info(
                 f"⏭️ 兜底标记失败时锁被占用，跳过: task_id={task_id}, "
@@ -503,8 +510,9 @@ async def get_status():
             },
         },
         "locks": {
-            "total": task_lock.lock_count,
-            "held": task_lock.held_lock_count,
+            "total": getattr(task_lock, 'lock_count', -1),
+            "held": getattr(task_lock, 'held_lock_count', -1),
+            "type": settings.lock_type,
         },
         "event_scheduler": {
             "running": event_scheduler.is_running,

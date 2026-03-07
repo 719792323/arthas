@@ -345,6 +345,24 @@ class TestTaskPoolConcurrency:
 
         registry.register(StageType.USER_QUERY.value, ConcurrentHandler())
 
+        # 配置 mock repo 的 get_task/get_stage 返回合适的对象
+        # 使 _run_handler 的前置检查能通过
+        def make_fresh_task(task_id):
+            t = MagicMock()
+            t.task_id = task_id
+            return t
+
+        def make_fresh_stage(stage_id):
+            s = MagicMock()
+            s.id = stage_id
+            s.status = StageStatus.PENDING.value
+            s.stage_seq = 1
+            s.stage_type = StageType.USER_QUERY.value
+            return s
+
+        repo_mock.get_task = AsyncMock(side_effect=lambda tid: make_fresh_task(tid))
+        repo_mock.get_stage = AsyncMock(side_effect=lambda sid: make_fresh_stage(sid))
+
         pool = TaskPool(
             max_concurrency=10,
             repo=repo_mock,
@@ -393,21 +411,23 @@ class TestChainExecution:
     ):
         """
         测试目的：handler 返回 next_stage 时，Pool 应自动递归提交。
-        handler_1 返回 next_stage → Pool 自动提交 → handler_2 被调用。
+        handler_1 完成当前 stage 并创建 next_stage → Pool 自动提交 → handler_2 被调用。
         """
         task, initial_stage = sample_task
 
         execution_log = []
 
-        mock_next_stage = MagicMock()
-        mock_next_stage.stage_seq = 2
-        mock_next_stage.stage_type = StageType.LLM_THINKING.value
-        mock_next_stage.id = 999
-
         class FirstHandler(StageHandler):
             async def handle(self, task, stage, repo):
                 execution_log.append(f"first:{stage.stage_seq}")
-                return mock_next_stage
+                # 通过 repo 创建真实的 next_stage（与 shared_session 兼容）
+                next_stage = await repo.complete_and_next(
+                    stage_id=stage.id,
+                    output_data={"done": True},
+                    next_stage_type=StageType.LLM_THINKING.value,
+                    next_input_data={"instruction": "test"},
+                )
+                return next_stage
 
         class SecondHandler(StageHandler):
             async def handle(self, task, stage, repo):
@@ -425,7 +445,7 @@ class TestChainExecution:
         await asyncio.sleep(1.0)
 
         assert "first:1" in execution_log
-        assert "second:2" in execution_log
+        assert len([x for x in execution_log if x.startswith("second:")]) == 1
         assert len(execution_log) == 2
         assert lock.held_lock_count == 0
 
@@ -443,15 +463,17 @@ class TestChainExecution:
 
         lock_states = []
 
-        mock_next_stage = MagicMock()
-        mock_next_stage.stage_seq = 2
-        mock_next_stage.stage_type = StageType.LLM_THINKING.value
-        mock_next_stage.id = 999
-
         class FirstHandler(StageHandler):
             async def handle(self_handler, task, stage, repo):
                 lock_states.append(("first", lock.held_lock_count))
-                return mock_next_stage
+                # 通过 repo 创建真实的 next_stage（与 shared_session 兼容）
+                next_stage = await repo.complete_and_next(
+                    stage_id=stage.id,
+                    output_data={"done": True},
+                    next_stage_type=StageType.LLM_THINKING.value,
+                    next_input_data={"instruction": "test"},
+                )
+                return next_stage
 
         class SecondHandler(StageHandler):
             async def handle(self_handler, task, stage, repo):

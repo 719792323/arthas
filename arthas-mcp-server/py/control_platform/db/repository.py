@@ -568,7 +568,12 @@ class DiagnosisRepository:
                 raise ValueError(f"Stage not found: {stage_id}")
 
             task_id = stage.task_id
-            next_seq = stage.stage_seq + 1
+
+            # 从 task.current_stage_seq 获取最新序号，而非 stage.stage_seq + 1
+            # 与 complete_and_next 保持一致：在并发场景下（如上下文优化插入了
+            # CONTEXT_SUMMARY stage），直接用 stage.stage_seq + 1 可能导致序号冲突
+            task = await session.get(DiagnosisTask, task_id)
+            next_seq = task.current_stage_seq + 1
 
             # 1. 标记当前 stage 为 failed
             stage.status = StageStatus.FAILED.value

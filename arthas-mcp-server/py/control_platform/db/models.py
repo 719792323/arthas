@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
 from enum import Enum as PyEnum
 
 from sqlalchemy import (
@@ -22,7 +21,12 @@ from sqlalchemy import (
     JSON,
     func,
 )
+from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import DeclarativeBase, relationship
+
+# 兼容 SQLite 和 MySQL 的大文本类型：
+# SQLite 下使用 Text（无长度限制），MySQL 下使用 LONGTEXT（最大 4GB）
+LargeText = Text().with_variant(LONGTEXT, "mysql")
 
 
 # ======================== 枚举定义 ========================
@@ -91,12 +95,12 @@ class DiagnosisTask(Base):
 
     task_id = Column(String(36), primary_key=True, default=_generate_uuid, comment="任务唯一标识（UUID）")
     session_id = Column(String(128), nullable=False, index=True, comment="关联的 Arthas 客户端会话 ID")
-    user_query = Column(Text, nullable=False, comment="用户原始提问")
+    user_query = Column(LargeText, nullable=False, comment="用户原始提问")
     status = Column(String(20), nullable=False, default=TaskStatus.RUNNING.value, comment="任务整体状态")
     current_stage_seq = Column(Integer, nullable=False, default=1, comment="当前最新 stage 序号")
     created_at = Column(DateTime, nullable=False, default=func.now(), comment="创建时间")
     updated_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now(), comment="最后更新时间")
-    conclusion = Column(Text, nullable=True, comment="最终诊断结论（LLM 生成）")
+    conclusion = Column(LargeText, nullable=True, comment="最终诊断结论（LLM 生成）")
     metadata_ = Column("metadata", JSON, nullable=True, comment="附加元数据")
 
     # 关联关系
@@ -123,7 +127,7 @@ class DiagnosisStage(Base):
     # 输入输出数据
     input_data = Column(JSON, nullable=True, comment="阶段输入（如用户问题、LLM prompt、命令参数等）")
     output_data = Column(JSON, nullable=True, comment="阶段输出（如 LLM 回复、Arthas 执行结果等）")
-    error_message = Column(Text, nullable=True, comment="失败时的错误信息")
+    error_message = Column(LargeText, nullable=True, comment="失败时的错误信息")
 
     # 重试控制
     retry_count = Column(Integer, nullable=False, default=0, comment="已重试次数")
@@ -132,7 +136,7 @@ class DiagnosisStage(Base):
     # 工具调用专属字段（仅 TOOL_CALL 类型有值）
     tool_name = Column(String(100), nullable=True, comment="工具/命令名称")
     tool_arguments = Column(JSON, nullable=True, comment="工具调用参数")
-    tool_result = Column(Text, nullable=True, comment="工具执行结果原文")
+    tool_result = Column(LargeText, nullable=True, comment="工具执行结果原文")
 
     # 审核相关字段
     approval_status = Column(String(20), nullable=True, default=ApprovalStatus.NOT_REQUIRED.value, comment="审核状态")
@@ -143,7 +147,7 @@ class DiagnosisStage(Base):
     last_sent_at = Column(DateTime, nullable=True, comment="最近一次发送工具调用请求的时间（用于冷却判断）")
 
     # 上下文摘要相关字段（不修改原始字段，仅新增）
-    summarized_content = Column(Text, nullable=True, comment="LLM 摘要后的内容，NULL 表示未摘要")
+    summarized_content = Column(LargeText, nullable=True, comment="LLM 摘要后的内容，NULL 表示未摘要")
     summary_tokens = Column(Integer, nullable=True, comment="摘要后的 token 数量")
     original_tokens = Column(Integer, nullable=True, comment="原始内容的 token 数量")
     summary_type = Column(String(20), nullable=True, comment="摘要类型: llm / rule / NULL")
@@ -182,12 +186,12 @@ class LlmPromptLog(Base):
     model = Column(String(100), nullable=True, comment="使用的 LLM 模型名称")
 
     # Prompt 内容
-    system_prompt = Column(Text, nullable=True, comment="系统提示词")
+    system_prompt = Column(LargeText, nullable=True, comment="系统提示词")
     chat_messages = Column(JSON, nullable=True, comment="完整的 chat messages（JSON 数组）")
     tools_schema = Column(JSON, nullable=True, comment="传给 LLM 的 tools schema（JSON 数组）")
 
     # 响应信息
-    response_content = Column(Text, nullable=True, comment="LLM 原始响应文本")
+    response_content = Column(LargeText, nullable=True, comment="LLM 原始响应文本")
     response_tool_calls = Column(JSON, nullable=True, comment="LLM 返回的 tool_calls（JSON）")
     finish_reason = Column(String(50), nullable=True, comment="LLM finish_reason")
     prompt_tokens = Column(Integer, nullable=True, comment="Prompt token 数")

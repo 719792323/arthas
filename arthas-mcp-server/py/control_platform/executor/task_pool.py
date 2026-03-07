@@ -11,6 +11,7 @@ import asyncio
 import logging
 from typing import Any, Optional, Set, TYPE_CHECKING
 
+from control_platform.db.database import shared_session
 from control_platform.executor.base import TaskExecutor
 from control_platform.lock.base import TaskLockNotAcquired
 from control_platform.db.models import StageStatus
@@ -138,6 +139,11 @@ class TaskPool(TaskExecutor):
         在执行前从 DB 重新加载 task 和 stage，确保使用最新数据，
         避免 detached ORM 对象和过时状态问题。
 
+        使用 shared_session() 包裹整个 handler 执行链，确保：
+        1. 重新加载 task/stage + handler 内部所有 repo 操作在同一事务中
+        2. handler 执行失败时自动 rollback 所有中间变更
+        3. handler 执行成功时统一 commit
+
         Returns:
             handler 返回的 next_stage（可能为 None）
         """
@@ -146,33 +152,35 @@ class TaskPool(TaskExecutor):
         stage_id = stage.id
         next_stage = None
         try:
-            # 从 DB 重新加载最新的 task 和 stage，避免使用 detached/过时的对象
-            fresh_task = await self._repo.get_task(task_id)
-            fresh_stage = await self._repo.get_stage(stage_id)
-            if fresh_task is None or fresh_stage is None:
-                logger.warning(
-                    f"⚠️ task 或 stage 已不存在，跳过: task_id={task_id}, "
-                    f"stage_id={stage.id}"
-                )
-                return None
-            if fresh_stage.status != StageStatus.PENDING.value:
-                logger.info(
-                    f"⏭️ stage 状态已非 PENDING（当前: {fresh_stage.status}），跳过: "
-                    f"task_id={task_id}, stage_seq={fresh_stage.stage_seq}"
-                )
-                return None
+            # shared_session 保证以下所有 repo 操作在同一个数据库事务中
+            async with shared_session():
+                # 从 DB 重新加载最新的 task 和 stage，避免使用 detached/过时的对象
+                fresh_task = await self._repo.get_task(task_id)
+                fresh_stage = await self._repo.get_stage(stage_id)
+                if fresh_task is None or fresh_stage is None:
+                    logger.warning(
+                        f"⚠️ task 或 stage 已不存在，跳过: task_id={task_id}, "
+                        f"stage_id={stage.id}"
+                    )
+                    return None
+                if fresh_stage.status != StageStatus.PENDING.value:
+                    logger.info(
+                        f"⏭️ stage 状态已非 PENDING（当前: {fresh_stage.status}），跳过: "
+                        f"task_id={task_id}, stage_seq={fresh_stage.stage_seq}"
+                    )
+                    return None
 
-            logger.info(
-                f"▶️ 开始处理 stage: task_id={task_id}, "
-                f"stage_type={stage_type}, stage_seq={fresh_stage.stage_seq}"
-            )
-            result = await handler.handle(fresh_task, fresh_stage, self._repo)
-            if result is not None:
-                next_stage = result
-            logger.info(
-                f"✅ stage 处理完成: task_id={task_id}, "
-                f"stage_type={stage_type}, stage_seq={stage.stage_seq}"
-            )
+                logger.info(
+                    f"▶️ 开始处理 stage: task_id={task_id}, "
+                    f"stage_type={stage_type}, stage_seq={fresh_stage.stage_seq}"
+                )
+                result = await handler.handle(fresh_task, fresh_stage, self._repo)
+                if result is not None:
+                    next_stage = result
+                logger.info(
+                    f"✅ stage 处理完成: task_id={task_id}, "
+                    f"stage_type={stage_type}, stage_seq={stage.stage_seq}"
+                )
         except Exception as e:
             logger.error(
                 f"❌ stage 处理失败: task_id={task_id}, "

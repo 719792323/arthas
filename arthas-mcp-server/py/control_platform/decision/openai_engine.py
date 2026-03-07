@@ -104,20 +104,31 @@ _NO_TOOLS_PROMPT = """\
 """
 
 
-def build_system_prompt(available_tools: List[Dict[str, Any]]) -> str:
+def build_system_prompt(
+    available_tools: List[Dict[str, Any]],
+    rag_context: Optional[Dict[str, Any]] = None,
+) -> str:
     """
     动态构建系统提示词
 
-    将角色设定 + ReAct 指令 + 工具列表拼接成完整的 system prompt。
+    将角色设定 + RAG 知识（可选）+ ReAct 指令 + 工具列表拼接成完整的 system prompt。
     工具列表根据 Arthas 客户端的 tools/list 响应动态生成。
 
     Args:
         available_tools: 从 MCP tools/list 获取的工具定义列表
+        rag_context: RAG 检索结果，包含 results 列表和 total_tokens
 
     Returns:
         完整的 system prompt 字符串
     """
-    parts = [_ROLE_PROMPT, _REACT_PROMPT]
+    parts = [_ROLE_PROMPT]
+
+    # RAG 知识注入：在 _ROLE_PROMPT 和 _REACT_PROMPT 之间插入
+    if rag_context and rag_context.get("results"):
+        rag_section = _build_rag_section(rag_context)
+        parts.append(rag_section)
+
+    parts.append(_REACT_PROMPT)
 
     if available_tools:
         tools_section = _TOOLS_PROMPT_HEADER
@@ -155,7 +166,35 @@ def build_system_prompt(available_tools: List[Dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
-# ==================== 文本 JSON 解析 ====================
+def _build_rag_section(rag_context: Dict[str, Any]) -> str:
+    """构建 RAG 知识段落
+
+    将 RAG 检索结果格式化为 Markdown 段落，插入到 System Prompt 中。
+
+    Args:
+        rag_context: RAG 检索结果，包含 results 列表
+
+    Returns:
+        格式化的 RAG 知识段落字符串
+    """
+    lines = [
+        "\n## 参考知识",
+        "以下是与用户问题相关的 Arthas 诊断知识，请参考但不要照搬，结合实际情况分析：",
+        "",
+    ]
+
+    for result in rag_context.get("results", []):
+        metadata = result.get("metadata", {})
+        file_name = metadata.get("file_name", "未知文档")
+        heading_path = metadata.get("heading_path", "")
+        source_label = f"{file_name} > {heading_path}" if heading_path else file_name
+
+        score = result.get("score", 0.0)
+        lines.append(f"### 来源: {source_label}（相似度: {score:.2f}）")
+        lines.append(result.get("document", ""))
+        lines.append("")
+
+    return "\n".join(lines)
 
 # 匹配 ```json ... ``` 代码块 或 裸 JSON 对象
 _JSON_BLOCK_RE = re.compile(
@@ -297,8 +336,11 @@ class OpenAIDecisionEngine(DecisionEngine):
                 "[OpenAI] 上下文优化失败（使用原始上下文继续）: %s", opt_err
             )
 
-        # 1. 动态构建 system prompt（含完整工具列表描述）
-        system_prompt = build_system_prompt(context.available_tools)
+        # 1. 动态构建 system prompt（含完整工具列表描述 + RAG 知识）
+        system_prompt = build_system_prompt(
+            context.available_tools,
+            rag_context=context.rag_context,
+        )
 
         # 2. 构建 OpenAI chat messages（system + 历史消息链）
         chat_messages = self._build_chat_messages(context, system_prompt)
